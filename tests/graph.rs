@@ -171,3 +171,58 @@ fn failed_branch_does_not_poison_next_workspace_call() {
     assert!(matches!(g.vjp(&[-1.0], &[1.0], &mut w), Err(AadError::NonFiniteResult { .. })));
     assert_eq!(g.vjp(&[1.0], &[1.0], &mut w).unwrap(), &[1.0]);
 }
+
+
+#[test]
+fn division_adjoint_survives_overflowing_denominator_square() {
+    let mut b = GraphBuilder::new();
+    let numerator = b.input();
+    let denominator = b.input();
+    let quotient = b.div(numerator, denominator).unwrap();
+    let g = b.compile(&[quotient]).unwrap();
+    let mut w = g.workspace();
+    // 1e300 / 1e200 = 1e100, while denominator squared overflows.
+    let gradient = g.vjp(&[1e300, 1e200], &[2.0], &mut w).unwrap();
+    assert!((gradient[0] / 2e-200 - 1.0).abs() < 1e-14);
+    assert!((gradient[1] / -2.0 - 1.0).abs() < 1e-14);
+}
+
+#[test]
+fn division_adjoint_survives_underflowing_denominator_square() {
+    let mut b = GraphBuilder::new();
+    let numerator = b.input();
+    let denominator = b.input();
+    let quotient = b.div(numerator, denominator).unwrap();
+    let g = b.compile(&[quotient]).unwrap();
+    let mut w = g.workspace();
+    let gradient = g.vjp(&[1e-200, 1e-200], &[1.0], &mut w).unwrap();
+    assert!((gradient[1] / -1e200 - 1.0).abs() < 1e-14);
+}
+
+#[test]
+fn nonfinite_division_adjoint_is_reported_and_workspace_recovers() {
+    let mut b = GraphBuilder::new();
+    let numerator = b.input();
+    let denominator = b.input();
+    let quotient = b.div(numerator, denominator).unwrap();
+    let g = b.compile(&[quotient]).unwrap();
+    let mut w = g.workspace();
+    assert!(matches!(
+        g.vjp(&[1.0, 1e-200], &[1e200], &mut w),
+        Err(AadError::NonFiniteResult { .. })
+    ));
+    assert_eq!(g.vjp(&[2.0, 4.0], &[1.0], &mut w).unwrap(), &[0.25, -0.125]);
+}
+
+
+#[test]
+fn division_adjoint_respects_signs_and_zero_seed() {
+    let mut b = GraphBuilder::new();
+    let n = b.input();
+    let d = b.input();
+    let q = b.div(n, d).unwrap();
+    let g = b.compile(&[q]).unwrap();
+    let mut w = g.workspace();
+    assert_eq!(g.vjp(&[-8.0, -2.0], &[1.0], &mut w).unwrap(), &[-0.5, 2.0]);
+    assert_eq!(g.vjp(&[1e300, 1e200], &[0.0], &mut w).unwrap(), &[0.0, 0.0]);
+}

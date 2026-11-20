@@ -69,3 +69,13 @@ Graph evaluation now uses an explicit per-workspace stack rather than recursive 
 `CompiledGraph::workspace()` preallocates the primal, adjoint, input-gradient, iterative evaluation stack and active-node buffers. Each forward call clears the active trace and records executed nodes in dependency-first order. VJP traverses only this active trace in reverse, rather than scanning every compiled node. A large branch not selected at runtime is not visited in reverse. `Workspace::executed_nodes()` and `Workspace::capacities()` expose simple diagnostics for regression tests; capacities alone do not prove zero allocations by the system allocator.
 
 The numeric semantics (tie-breaking for `min/max`, pathwise derivative through the chosen select branch, and error handling) remain experimental. The project has not yet been built or benchmarked in this conversation; CI execution is still required.
+
+## Stable numerical adjoints (experimental)
+
+The division VJP computes the denominator derivative with exponent scaling when
+intermediate binary64 products or denominator squares overflow or underflow.
+The implementation aims to retain mathematically finite derivatives instead of
+silently emitting infinities or zeros. Truly nonfinite adjoints remain errors.
+Regression tests cover both exponent extremes and workspace recovery after an
+error. Correct rounding, cross-platform bitwise identity, and release quality
+are **not** claimed; run Rust CI before use.

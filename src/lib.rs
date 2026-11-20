@@ -179,7 +179,7 @@ impl CompiledGraph {
                 Op::Add(a,b)=>{w.adjoint[a.0]+=seed;w.adjoint[b.0]+=seed;},
                 Op::Sub(a,b)=>{w.adjoint[a.0]+=seed;w.adjoint[b.0]-=seed;},
                 Op::Mul(a,b)=>{w.adjoint[a.0]+=seed*p[b.0];w.adjoint[b.0]+=seed*p[a.0];},
-                Op::Div(a,b)=>{w.adjoint[a.0]+=seed/p[b.0];w.adjoint[b.0]-=seed*p[a.0]/(p[b.0]*p[b.0]);},
+                Op::Div(a,b)=>{w.adjoint[a.0]+=seed/p[b.0];w.adjoint[b.0]+=division_denominator_adjoint(seed,p[a.0],p[b.0]);},
                 Op::Neg(a)=>w.adjoint[a.0]-=seed,
                 Op::Exp(a)=>w.adjoint[a.0]+=seed*p[i],
                 Op::Ln(a)=>w.adjoint[a.0]+=seed/p[a.0],
@@ -233,3 +233,52 @@ impl Workspace {
     pub fn executed_nodes(&self) -> usize { self.active.len() }
 }
 
+
+
+/// Compute -seed*numerator/denominator^2 without discarding a representable
+/// derivative when an intermediate product or square overflows/underflows.
+/// Forward division has already checked its result for finiteness.
+fn division_denominator_adjoint(seed: f64, numerator: f64, denominator: f64) -> f64 {
+    let product = -seed * numerator;
+    let square = denominator * denominator;
+    if square.is_normal() && product.is_normal() {
+        return product / square;
+    }
+    if seed == 0.0 || numerator == 0.0 {
+        return product;
+    }
+    // Decompose nonzero finite binary64 values into [1,2) significands
+    // and base-two exponents. Inputs here are finite from the primal check.
+    let (sf, se) = binary_parts(seed);
+    let (nf, ne) = binary_parts(numerator);
+    let (df, de) = binary_parts(denominator);
+    let fraction = -sf * nf / (df * df);
+    scale_binary(fraction, se + ne - 2 * de)
+}
+
+fn binary_parts(value: f64) -> (f64, i32) {
+    let (value, correction) = if value.is_subnormal() {
+        (value * 18_014_398_509_481_984.0, -54)
+    } else {
+        (value, 0)
+    };
+    let bits = value.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32 - 1023 + correction;
+    let significand = f64::from_bits((bits & 0x800f_ffff_ffff_ffff) | (1023_u64 << 52));
+    (significand, exponent)
+}
+
+fn scale_binary(fraction: f64, exponent: i32) -> f64 {
+    let power = |e: i32| f64::from_bits(((e + 1023) as u64) << 52);
+    if exponent > 1025 {
+        f64::INFINITY.copysign(fraction)
+    } else if exponent < -1076 {
+        0.0_f64.copysign(fraction)
+    } else if exponent > 1023 {
+        (fraction * power(exponent - 1023)) * power(1023)
+    } else if exponent < -1022 {
+        (fraction * power(exponent + 1022)) * f64::MIN_POSITIVE
+    } else {
+        fraction * power(exponent)
+    }
+}
