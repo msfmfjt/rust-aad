@@ -72,12 +72,12 @@ impl GraphBuilder {
         if outputs.is_empty() { return Err(AadError::EmptyOutputs); }
         if self.nodes.len() > MAX_NODES { return Err(AadError::GraphTooLarge); }
         for &o in outputs { self.check(o)?; }
-        Ok(CompiledGraph { nodes: self.nodes.into_boxed_slice(), outputs: outputs.into(), input_count:self.input_count })
+        Ok(CompiledGraph { nodes: self.nodes.into_boxed_slice(), outputs: outputs.into(), input_count:self.input_count, graph_id:self.graph_id })
     }
 }
 
 /// Immutable graph, shareable across workers. Each worker needs its own Workspace.
-pub struct CompiledGraph { nodes: Box<[Op]>, outputs: Box<[NodeId]>, input_count: usize }
+pub struct CompiledGraph { nodes: Box<[Op]>, outputs: Box<[NodeId]>, input_count: usize, graph_id: u64 }
 impl CompiledGraph {
     pub fn input_count(&self)->usize{self.input_count}
     pub fn output_count(&self)->usize{self.outputs.len()}
@@ -85,46 +85,76 @@ impl CompiledGraph {
     pub fn workspace(&self)->Workspace{Workspace {
         primal:vec![0.0;self.nodes.len()], adjoint:vec![0.0;self.nodes.len()],
         visited:vec![false;self.nodes.len()], output:vec![0.0;self.outputs.len()],
-        input_adjoints:vec![0.0;self.input_count],
+        input_adjoints:vec![0.0;self.input_count], stack:Vec::with_capacity(self.nodes.len().saturating_mul(3)), graph_id:self.graph_id,
     }}
     fn preflight(&self,inputs:&[f64],w:&Workspace)->Result<(),AadError>{
         if inputs.len()!=self.input_count{return Err(AadError::InputShape)}
         if inputs.iter().any(|v|!v.is_finite()){return Err(AadError::NonFiniteInput)}
-        if w.primal.len()!=self.nodes.len()||w.adjoint.len()!=self.nodes.len()||w.visited.len()!=self.nodes.len()||w.output.len()!=self.outputs.len()||w.input_adjoints.len()!=self.input_count {
+        if w.graph_id!=self.graph_id || w.primal.len()!=self.nodes.len()||w.adjoint.len()!=self.nodes.len()||w.visited.len()!=self.nodes.len()||w.output.len()!=self.outputs.len()||w.input_adjoints.len()!=self.input_count {
             return Err(AadError::InvalidWorkspace)
         }
         Ok(())
     }
+    // An explicit evaluation stack avoids recursion depth proportional to graph depth.
+    // Phase 0 = schedule prerequisites, 1 = evaluate, 2 = resolve a lazy select.
     fn eval(&self, id:NodeId,inputs:&[f64],w:&mut Workspace)->Result<f64,AadError>{
-        if w.visited[id.0]{return Ok(w.primal[id.0])}
-        let value=match self.nodes[id.0]{
-            Op::Input(i)=>inputs[i], Op::Constant(v)=>v,
-            Op::Neg(a)=>-self.eval(a,inputs,w)?,
-            Op::Exp(a)=>self.eval(a,inputs,w)?.exp(),
-            Op::Ln(a)=>self.eval(a,inputs,w)?.ln(),
-            Op::Select{condition,positive,zero}=>{
-                let c=self.eval(condition,inputs,w)?;
-                self.eval(if c!=0.0{positive}else{zero},inputs,w)?
-            }
-            other=>{
-                let (a,b)=match other{
-                    Op::Add(a,b)|Op::Sub(a,b)|Op::Mul(a,b)|Op::Div(a,b)|Op::Greater(a,b)|Op::Min(a,b)|Op::Max(a,b)=>(a,b),
-                    _=>unreachable!(),
-                };
-                let x=self.eval(a,inputs,w)?;let y=self.eval(b,inputs,w)?;
-                match other{
-                    Op::Add(..)=>x+y,Op::Sub(..)=>x-y,Op::Mul(..)=>x*y,Op::Div(..)=>x/y,
-                    Op::Greater(..)=>if x>y{1.0}else{0.0},
-                    Op::Min(..)=>x.min(y),Op::Max(..)=>x.max(y),_=>unreachable!(),
+        w.stack.push((id, 0));
+        while let Some((id, phase)) = w.stack.pop() {
+            let i = id.0;
+            if w.visited[i] { continue; }
+            let op = self.nodes[i];
+            if phase == 0 {
+                match op {
+                    Op::Input(_) | Op::Constant(_) => w.stack.push((id, 1)),
+                    Op::Select {condition, ..} => {
+                        w.stack.push((id, 2));
+                        if !w.visited[condition.0] { w.stack.push((condition, 0)); }
+                    }
+                    Op::Neg(a) | Op::Exp(a) | Op::Ln(a) => {
+                        w.stack.push((id, 1));
+                        if !w.visited[a.0] { w.stack.push((a, 0)); }
+                    }
+                    Op::Add(a,b) | Op::Sub(a,b) | Op::Mul(a,b) |
+                    Op::Div(a,b) | Op::Greater(a,b) | Op::Min(a,b) | Op::Max(a,b) => {
+                        w.stack.push((id, 1));
+                        if !w.visited[b.0] { w.stack.push((b, 0)); }
+                        if !w.visited[a.0] { w.stack.push((a, 0)); }
+                    }
                 }
+                continue;
             }
-        };
-        if !value.is_finite(){return Err(AadError::NonFiniteResult{node:id.0})}
-        w.primal[id.0]=value;w.visited[id.0]=true;Ok(value)
+            if phase == 2 {
+                if let Op::Select {condition,positive,zero} = op {
+                    let selected = if w.primal[condition.0]!=0.0 { positive } else { zero };
+                    w.stack.push((id, 1));
+                    if !w.visited[selected.0] { w.stack.push((selected, 0)); }
+                }
+                continue;
+            }
+            let p=&w.primal;
+            let value=match op {
+                Op::Input(k)=>inputs[k], Op::Constant(v)=>v,
+                Op::Neg(a)=>-p[a.0], Op::Exp(a)=>p[a.0].exp(), Op::Ln(a)=>p[a.0].ln(),
+                Op::Select {condition,positive,zero}=> {
+                    p[if p[condition.0]!=0.0 {positive.0}else{zero.0}]
+                }
+                Op::Add(a,b)=>p[a.0]+p[b.0],
+                Op::Sub(a,b)=>p[a.0]-p[b.0],
+                Op::Mul(a,b)=>p[a.0]*p[b.0],
+                Op::Div(a,b)=>p[a.0]/p[b.0],
+                Op::Greater(a,b)=>if p[a.0]>p[b.0]{1.0}else{0.0},
+                Op::Min(a,b)=>p[a.0].min(p[b.0]),
+                Op::Max(a,b)=>p[a.0].max(p[b.0]),
+            };
+            if !value.is_finite(){w.stack.clear();return Err(AadError::NonFiniteResult{node:i})}
+            w.primal[i]=value;
+            w.visited[i]=true;
+        }
+        Ok(w.primal[id.0])
     }
     /// Evaluate all outputs. The workspace owns returned values; each call overwrites them.
     pub fn evaluate<'a>(&self,inputs:&[f64],w:&'a mut Workspace)->Result<&'a [f64],AadError>{
-        self.preflight(inputs,w)?;w.visited.fill(false);
+        self.preflight(inputs,w)?;w.visited.fill(false);w.stack.clear();
         for (k,&id) in self.outputs.iter().enumerate(){w.output[k]=self.eval(id,inputs,w)?;}
         Ok(&w.output)
     }
@@ -165,4 +195,4 @@ impl CompiledGraph {
     }
 }
 /// Mutable per-worker cache. Do not share between concurrent evaluations.
-pub struct Workspace { primal:Vec<f64>,adjoint:Vec<f64>,visited:Vec<bool>,output:Vec<f64>,input_adjoints:Vec<f64> }
+pub struct Workspace { primal:Vec<f64>,adjoint:Vec<f64>,visited:Vec<bool>,output:Vec<f64>,input_adjoints:Vec<f64>,stack:Vec<(NodeId,u8)>,graph_id:u64 }

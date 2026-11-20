@@ -75,3 +75,43 @@ fn repeated_workspace_calls_do_not_leak_old_branches_or_gradients() {
         assert_eq!(graph.vjp(&[input], &[1.0], &mut w).unwrap(), &[expected]);
     }
 }
+
+#[test]
+fn very_deep_graph_uses_explicit_stack_not_native_recursion() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let one = b.constant(1.0).unwrap();
+    let mut y = x;
+    for _ in 0..50_000 { y = b.add(y, one).unwrap(); }
+    let g = b.compile(&[y]).unwrap();
+    let mut w = g.workspace();
+    assert_eq!(g.evaluate(&[2.0], &mut w).unwrap(), &[50_002.0]);
+    assert_eq!(g.vjp(&[2.0], &[1.0], &mut w).unwrap(), &[1.0]);
+}
+
+#[test]
+fn branch_with_deep_invalid_inactive_arm_is_not_evaluated() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let zero = b.constant(0.0).unwrap();
+    let condition = b.greater(x, zero).unwrap();
+    let mut invalid = b.ln(x).unwrap();
+    for _ in 0..20_000 { let temp = b.ln(invalid).unwrap(); invalid = b.exp(temp).unwrap(); }
+    let safe = b.neg(x).unwrap();
+    let out = b.select(condition, invalid, safe).unwrap();
+    let g = b.compile(&[out]).unwrap();
+    let mut w = g.workspace();
+    assert_eq!(g.vjp(&[-2.0], &[1.0], &mut w).unwrap(), &[-1.0]);
+}
+
+#[test]
+fn workspace_must_belong_to_compiled_graph_even_when_shapes_match() {
+    let mut b1=GraphBuilder::new();
+    let x=b1.input();
+    let g1=b1.compile(&[x]).unwrap();
+    let mut b2=GraphBuilder::new();
+    let y=b2.input();
+    let g2=b2.compile(&[y]).unwrap();
+    let mut w=g1.workspace();
+    assert_eq!(g2.evaluate(&[1.0],&mut w).unwrap_err(), AadError::InvalidWorkspace);
+}

@@ -20,7 +20,9 @@ The bootstrap graph is a deliberately smaller independent prototype; it is **not
 - `CompiledGraph` is immutable and should be shareable between threads.
 - `Workspace` owns mutable scratch storage; one per worker.
 - `evaluate` reuses primal workspace; `vjp` accepts arbitrary output seeds and returns input adjoints.
-- Later: iterative execution scheduler, compact register allocation, generalized custom VJP, checkpoint/recompute policies, batched SIMD, optional isolated JIT backend.
+- Iterative evaluation now uses a per-workspace explicit task stack; inactive conditional branches are not evaluated, and the reverse sweep follows visited nodes.
+- Workspaces carry a compiled-graph identity, not just shape, and cannot be used with another graph.
+- Still pending: compact register allocation, generalized custom VJP, checkpoint/recompute policies, batched SIMD, optional isolated JIT backend.
 
 ## Integration
 
@@ -29,3 +31,9 @@ The financial project maps `(underlying, date, pre/post-dividend)` observations 
 ## Safety / compatibility
 
 Keep `#![forbid(unsafe_code)]` in the core. Do not promise bitwise identity across hardware or different backends. Do not publish until performance and numerical contracts, CI, licenses and crates.io naming have been reviewed.
+
+## Iterative evaluator constraints (experimental)
+
+The interpreter schedules each node using a two-stage explicit stack (plus a conditional-dispatch stage). It evaluates dependencies before their consumer and evaluates only the chosen branch for `Select`. The scratch stack is owned by the per-worker workspace, and it is cleared at the start of each forward or VJP call. This avoids native call-stack exhaustion for long sequential DAGs; it does not prove optimal CPU cache behavior or full memory-allocator elimination.
+
+Tests include a 50,000-step dependency chain, an invalid inactive branch with 20,000 nested nodes, graph identity checks, and repeated VJP calls. **Rust toolchain execution is still required** before claiming these tests pass.
