@@ -50,4 +50,22 @@ fn main() {
         &[-1.0, 0.0]
     );
     check_reuse("error and recovery", region.change());
+    #[cfg(feature = "simd")]
+    check_batch();
+}
+
+#[cfg(feature = "simd")]
+fn check_batch() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let y = b.mul(x, x).unwrap();
+    let graph = b.compile(&[x, y]).unwrap();
+    let mut batch = graph.batch2().unwrap();
+    let region = Region::new(ALLOCATOR);
+    for i in 0..256 {
+        let x = [[i as f64, -(i as f64)]];
+        black_box(batch.evaluate(&x).unwrap());
+        black_box(batch.vjp(&x, &[[0.5, -0.5], [1.0, 2.0]]).unwrap());
+    }
+    check_reuse("256 SIMD pairs per method", region.change());
 }

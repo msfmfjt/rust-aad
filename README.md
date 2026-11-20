@@ -4,7 +4,7 @@ An **experimental** Rust reverse-mode AD library for reusable numerical computat
 
 ## Status
 
-P1 prototype, not a released library. This bootstrap includes a small, zero-dependency `f64` graph interpreter with multiple outputs, arbitrary VJP seeds, lazy conditionals, and reusable per-worker workspace. It is **not yet** a full implementation of the parent Pricing Library's payoff graph and does not contain JIT, SIMD batch kernels, custom VJP, or checkpointing. No benchmark results have been produced.
+P1 prototype, not a released library. This bootstrap includes a small, default-feature zero-dependency `f64` graph interpreter with multiple outputs, arbitrary VJP seeds, lazy conditionals, and reusable per-worker workspace. It is **not yet** a full implementation of the parent Pricing Library's payoff graph and does not contain JIT, custom VJP, or checkpointing.
 
 ## Example
 
@@ -79,3 +79,14 @@ silently emitting infinities or zeros. Truly nonfinite adjoints remain errors.
 Regression tests cover both exponent extremes and workspace recovery after an
 error. Correct rounding, cross-platform bitwise identity, and release quality
 are **not** claimed; run Rust CI before use.
+
+
+## Experimental two-path SIMD
+
+Enable `--features simd` and call `CompiledGraph::batch2()` once per worker.
+The result owns a prepared two-lane tape. Pass one `[f64; 2]` per input to
+`evaluate`, or pass inputs and one seed pair per output to `vjp`. Lane 0 and
+lane 1 are independent paths. Dispatch an odd final path to the scalar workspace.
+The kernel supports reachable constants, inputs, add, subtract, multiply and
+negate. A graph with any other reachable operation returns `None`; use the
+scalar evaluator for lazy branches, scaled division and transcendental functions.

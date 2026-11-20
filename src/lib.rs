@@ -7,6 +7,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(feature = "simd")]
+mod batch;
+#[cfg(feature = "simd")]
+pub use batch::Batch2;
+
 const MAX_NODES: usize = u16::MAX as usize + 1;
 static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 

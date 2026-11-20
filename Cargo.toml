@@ -25,3 +25,9 @@ stats_alloc = "0.1.10"
 [[test]]
 name = "allocations"
 harness = false
+
+[dependencies]
+wide = { version = "0.7.33", default-features = false, optional = true }
+
+[features]
+simd = ["dep:wide"]

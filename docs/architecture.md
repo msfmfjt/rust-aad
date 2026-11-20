@@ -22,7 +22,7 @@ The bootstrap graph is a deliberately smaller independent prototype; it is **not
 - `evaluate` reuses primal workspace; `vjp` accepts arbitrary output seeds and returns input adjoints.
 - Iterative evaluation now uses a per-workspace explicit task stack; inactive conditional branches are not evaluated, and the reverse sweep follows visited nodes.
 - Workspaces carry a compiled-graph identity, not just shape, and cannot be used with another graph.
-- Still pending: compact register allocation, generalized custom VJP, checkpoint/recompute policies, batched SIMD, optional isolated JIT backend.
+- Still pending: compact register allocation, generalized custom VJP, checkpoint/recompute policies, broader SIMD opcode coverage, optional isolated JIT backend.
 
 ## Integration
 
