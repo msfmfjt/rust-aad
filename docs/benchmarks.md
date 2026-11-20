@@ -1,4 +1,4 @@
-# P0 benchmark plan (no results yet)
+# Reproducible benchmarks
 
 Baseline on `msfmfjt/rust-pricing-library` commit `f82a8b2c3fb2231959ae4104ec30778cdba683a1`. Measure *both* original and independent versions with identical inputs and workloads.
 
@@ -14,7 +14,7 @@ Collect graph compilation time, initial workspace allocation, warm forward-only,
 
 ## P0 gate
 
-No performance claim until actual measured baseline records exist. Automated benchmarks are a next deliverable; none have been run for this bootstrap.
+Use full application fixtures for application-level performance comparisons. The numeric kernel below provides a portable first workload.
 
 ## Initial executable benchmark
 
@@ -34,3 +34,38 @@ bytes across seven allocations on the same fixture. Both versions recorded
 zero allocations and reallocations in 256 forward calls and separately in 256
 VJP calls. These numbers measure requested heap bytes, excluding graph storage,
 allocator overhead and process RSS.
+
+### Fixed numeric workload for scalar, SIMD and external replay
+
+Run `cargo run --locked --release --features simd --example fixed_batch`.
+The workload ID is `affine32-v1`. On one thread, generate 10,000 paths indexed
+from zero. Each row contains two binary64 numbers, in this order:
+
+```text
+x = ((47*i mod 1021) - 510) / 256
+q = 1 + ((31*i mod 127) - 63) / 4096
+```
+
+Concatenate little-endian f64 bytes in row order. The FNV-1a 64-bit input
+digest is `a7bf6211c9ab67d9`. Record two input nodes, a single constant 1/64,
+and 32 separate multiplications and additions for `s = s*q + 1/64`, starting
+from `s = x`. The two outputs are `[s, s*x]` (68 nodes). The VJP seeds are
+`[1, -0.5]`. Keep f64, separate multiply/add, and all paths, outputs and input
+adjoints in an external implementation. Before timing, compare every value and
+gradient with the independent forward derivative recurrence in the example.
+The tolerance is `2e-13 * (1 + abs(reference))`.
+
+Prepack inputs in each backend's native layout, compile once, and allocate one
+workspace. Time forward and forward-plus-VJP separately after one warm-up for
+each case. JSONL reports minimum, median and maximum wall time in nanoseconds
+over eleven samples of the entire 10,000-path workload. Timings exclude graph
+construction, data conversion, validation against the oracle and workspace
+creation. Library range/shape checks remain enabled. The simd2 executor also
+prepares a static tape, so backend timing differences include dispatch and
+scheduling as well as packed arithmetic.
+
+PR runs retain the four records and host/toolchain metadata per OS as
+`affine32-<os>` artifacts. For an AADC or XAD comparison, record the actual
+library version and compiler/optimization flags, repeat on the same host and
+report recording/JIT costs separately. The repository currently measures Rust
+backends only.

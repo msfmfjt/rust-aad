@@ -31,3 +31,7 @@ wide = { version = "0.7.33", default-features = false, optional = true }
 
 [features]
 simd = ["dep:wide"]
+
+[[example]]
+name = "fixed_batch"
+required-features = ["simd"]
