@@ -15,3 +15,9 @@ Collect graph compilation time, initial workspace allocation, warm forward-only,
 ## P0 gate
 
 No performance claim until actual measured baseline records exist. Automated benchmarks are a next deliverable; none have been run for this bootstrap.
+
+## Initial executable benchmark
+
+`cargo run --release --example baseline -- 100000` runs a 32-observation arithmetic-average payoff graph with fixed deterministic inputs. It reports warmed forward-only and forward+VJP median nanoseconds for seven repetitions as a JSON line. CI includes a manual `workflow_dispatch` baseline job that stores the JSON line and host/toolchain metadata as artifacts.
+
+This is an **interpreter-only smoke benchmark**, not a valid AADC/XAD or pre-extraction Pricing comparison. GitHub-hosted runners have variable performance; compare release builds on the same pinned host, and benchmark allocations/peak memory separately. The warm loop includes input construction, graph evaluation and result reads, not graph compilation.

@@ -53,3 +53,9 @@ See [architecture](docs/architecture.md) and [benchmark plan](docs/benchmarks.md
 ## License
 
 MIT OR Apache-2.0.
+
+## CI and baseline
+
+GitHub Actions tests on Linux, macOS, and Windows. Once this source is pushed to GitHub, open **Actions → Rust CI → Run workflow** to run a manual Linux interpreter-only benchmark and retrieve `aad-baseline-linux`. GitHub-hosted runner results are smoke measurements, not stable performance comparison evidence. The benchmark is run locally with `cargo run --release --example baseline -- 100000`.
+
+The immutable graph's `NodeId`s now include a builder identity to reject nodes belonging to a different graph; VJP rejects nonfinite intermediate adjoint arrays. This is still a prototype, with recursive evaluation and no validated AADC parity.

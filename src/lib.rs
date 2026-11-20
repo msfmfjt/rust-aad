@@ -1,13 +1,14 @@
 //! Experimental f64 graph with lazy branches and reusable primal/adjoint storage.
 //! Not yet a performance replacement for AADC/XAD.
 #![forbid(unsafe_code)]
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::atomic::{AtomicU64, Ordering}};
 
 const MAX_NODES: usize = 65_536;
+static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Graph-local handle; cannot be constructed outside the library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct NodeId(usize);
+pub struct NodeId(usize, u64);
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
@@ -29,11 +30,15 @@ impl fmt::Display for AadError {
 impl Error for AadError {}
 
 /// Construct an immutable graph. Nodes are topologically ordered by construction.
-#[derive(Default)]
-pub struct GraphBuilder { nodes: Vec<Op>, input_count: usize }
+pub struct GraphBuilder { nodes: Vec<Op>, input_count: usize, graph_id: u64 }
+impl Default for GraphBuilder {
+    fn default() -> Self {
+        Self { nodes: Vec::new(), input_count: 0, graph_id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed) }
+    }
+}
 impl GraphBuilder {
     pub fn new() -> Self { Self::default() }
-    fn push(&mut self, op: Op) -> NodeId { let id = NodeId(self.nodes.len()); self.nodes.push(op); id }
+    fn push(&mut self, op: Op) -> NodeId { let id = NodeId(self.nodes.len(), self.graph_id); self.nodes.push(op); id }
     pub fn input(&mut self) -> NodeId { let i = self.input_count; self.input_count += 1; self.push(Op::Input(i)) }
     pub fn constant(&mut self, v: f64) -> Result<NodeId, AadError> {
         if !v.is_finite() { return Err(AadError::InvalidConstant); }
@@ -46,7 +51,7 @@ impl GraphBuilder {
         self.check(a)?; self.check(b)?; Ok(self.push(f(a,b)))
     }
     fn check(&self, node: NodeId) -> Result<(), AadError> {
-        if node.0 >= self.nodes.len() { Err(AadError::InvalidNode) } else { Ok(()) }
+        if node.1 != self.graph_id || node.0 >= self.nodes.len() { Err(AadError::InvalidNode) } else { Ok(()) }
     }
     pub fn add(&mut self, a: NodeId,b: NodeId)->Result<NodeId,AadError>{self.binary(a,b,Op::Add)}
     pub fn sub(&mut self, a: NodeId,b: NodeId)->Result<NodeId,AadError>{self.binary(a,b,Op::Sub)}
@@ -151,6 +156,9 @@ impl CompiledGraph {
                 }
             }
             if !w.adjoint[i].is_finite(){return Err(AadError::NonFiniteResult{node:i})}
+        }
+        if let Some((i, _)) = w.adjoint.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+            return Err(AadError::NonFiniteResult { node: i });
         }
         if w.input_adjoints.iter().any(|v|!v.is_finite()){return Err(AadError::NonFiniteResult{node:0})}
         Ok(&w.input_adjoints)
