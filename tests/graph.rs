@@ -184,7 +184,7 @@ fn division_adjoint_survives_overflowing_denominator_square() {
     // 1e300 / 1e200 = 1e100, while denominator squared overflows.
     let gradient = g.vjp(&[1e300, 1e200], &[2.0], &mut w).unwrap();
     assert!((gradient[0] / 2e-200 - 1.0).abs() < 1e-14);
-    assert!((gradient[1] / -2.0 - 1.0).abs() < 1e-14);
+    assert!((gradient[1] / -2e-100 - 1.0).abs() < 1e-14);
 }
 
 #[test]
