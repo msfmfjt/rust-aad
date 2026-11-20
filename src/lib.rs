@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-const MAX_NODES: usize = 65_536;
+const MAX_NODES: usize = u16::MAX as usize + 1;
 static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Graph-local handle; cannot be constructed outside the library.
@@ -199,7 +199,8 @@ impl CompiledGraph {
             visited: vec![false; self.nodes.len()],
             output: vec![0.0; self.outputs.len()],
             input_adjoints: vec![0.0; self.input_count],
-            stack: Vec::with_capacity(self.nodes.len().saturating_mul(3)),
+            // Each unfinished ancestor leaves at most a finish task and a sibling.
+            stack: Vec::with_capacity(self.nodes.len() * 2),
             active: Vec::with_capacity(self.nodes.len()),
             graph_id: self.graph_id,
         }
@@ -224,28 +225,28 @@ impl CompiledGraph {
         Ok(())
     }
     // An explicit evaluation stack avoids recursion depth proportional to graph depth.
-    // Phase 0 = schedule prerequisites, 1 = evaluate, 2 = resolve a lazy select.
     fn eval(&self, id: NodeId, inputs: &[f64], w: &mut Workspace) -> Result<f64, AadError> {
-        w.stack.push((id, 0));
-        while let Some((id, phase)) = w.stack.pop() {
-            let i = id.0;
+        // Compilation bounds every graph-local index by u16::MAX.
+        w.stack.push((id.0 as u16, Phase::Visit));
+        while let Some((slot, phase)) = w.stack.pop() {
+            let i = usize::from(slot);
             if w.visited[i] {
                 continue;
             }
             let op = self.nodes[i];
-            if phase == 0 {
+            if phase == Phase::Visit {
                 match op {
-                    Op::Input(_) | Op::Constant(_) => w.stack.push((id, 1)),
+                    Op::Input(_) | Op::Constant(_) => w.stack.push((slot, Phase::Finish)),
                     Op::Select { condition, .. } => {
-                        w.stack.push((id, 2));
+                        w.stack.push((slot, Phase::Choose));
                         if !w.visited[condition.0] {
-                            w.stack.push((condition, 0));
+                            w.stack.push((condition.0 as u16, Phase::Visit));
                         }
                     }
                     Op::Neg(a) | Op::Exp(a) | Op::Ln(a) => {
-                        w.stack.push((id, 1));
+                        w.stack.push((slot, Phase::Finish));
                         if !w.visited[a.0] {
-                            w.stack.push((a, 0));
+                            w.stack.push((a.0 as u16, Phase::Visit));
                         }
                     }
                     Op::Add(a, b)
@@ -255,18 +256,18 @@ impl CompiledGraph {
                     | Op::Greater(a, b)
                     | Op::Min(a, b)
                     | Op::Max(a, b) => {
-                        w.stack.push((id, 1));
+                        w.stack.push((slot, Phase::Finish));
                         if !w.visited[b.0] {
-                            w.stack.push((b, 0));
+                            w.stack.push((b.0 as u16, Phase::Visit));
                         }
                         if !w.visited[a.0] {
-                            w.stack.push((a, 0));
+                            w.stack.push((a.0 as u16, Phase::Visit));
                         }
                     }
                 }
                 continue;
             }
-            if phase == 2 {
+            if phase == Phase::Choose {
                 if let Op::Select {
                     condition,
                     positive,
@@ -278,9 +279,9 @@ impl CompiledGraph {
                     } else {
                         zero
                     };
-                    w.stack.push((id, 1));
+                    w.stack.push((slot, Phase::Finish));
                     if !w.visited[selected.0] {
-                        w.stack.push((selected, 0));
+                        w.stack.push((selected.0 as u16, Phase::Visit));
                     }
                 }
                 continue;
@@ -430,6 +431,13 @@ impl CompiledGraph {
         Ok(&w.input_adjoints)
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Visit,
+    Choose,
+    Finish,
+}
+
 /// Mutable per-worker cache. Do not share between concurrent evaluations.
 pub struct Workspace {
     primal: Vec<f64>,
@@ -437,7 +445,7 @@ pub struct Workspace {
     visited: Vec<bool>,
     output: Vec<f64>,
     input_adjoints: Vec<f64>,
-    stack: Vec<(NodeId, u8)>,
+    stack: Vec<(u16, Phase)>,
     active: Vec<usize>,
     graph_id: u64,
 }

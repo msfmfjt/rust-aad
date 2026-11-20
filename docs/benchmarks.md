@@ -21,3 +21,16 @@ No performance claim until actual measured baseline records exist. Automated ben
 `cargo run --release --example baseline -- 100000` runs a 32-observation arithmetic-average payoff graph with fixed deterministic inputs. It reports warmed forward-only and forward+VJP median nanoseconds for seven repetitions as a JSON line. CI includes a manual `workflow_dispatch` baseline job that stores the JSON line and host/toolchain metadata as artifacts.
 
 This is an **interpreter-only smoke benchmark**, not a valid AADC/XAD or pre-extraction Pricing comparison. GitHub-hosted runners have variable performance; compare release builds on the same pinned host, and benchmark allocations/peak memory separately. The warm loop includes input construction, graph evaluation and result reads, not graph compilation.
+
+### Workspace allocation measurement
+
+Run `cargo test --release --locked --test allocations`. Its standalone process
+counts system-allocator requests for workspace construction and for reuse.
+The 1,030-node fixture alternates a 1,024-add chain and a short lazy branch.
+On aarch64 macOS (rustc 1.92.0, release), the original stack at `2d3d149`
+requested 99,942 bytes across seven workspace allocations. Storing graph-local
+16-bit slots and reserving two pending tasks per node reduced this to 34,022
+bytes across seven allocations on the same fixture. Both versions recorded
+zero allocations and reallocations in 256 forward calls and separately in 256
+VJP calls. These numbers measure requested heap bytes, excluding graph storage,
+allocator overhead and process RSS.
