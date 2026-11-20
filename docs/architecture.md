@@ -37,3 +37,7 @@ Keep `#![forbid(unsafe_code)]` in the core. Do not promise bitwise identity acro
 The interpreter schedules each node using a two-stage explicit stack (plus a conditional-dispatch stage). It evaluates dependencies before their consumer and evaluates only the chosen branch for `Select`. The scratch stack is owned by the per-worker workspace, and it is cleared at the start of each forward or VJP call. This avoids native call-stack exhaustion for long sequential DAGs; it does not prove optimal CPU cache behavior or full memory-allocator elimination.
 
 Tests include a 50,000-step dependency chain, an invalid inactive branch with 20,000 nested nodes, graph identity checks, and repeated VJP calls. **Rust toolchain execution is still required** before claiming these tests pass.
+
+## Active execution trace for reverse (P1 iteration)
+
+During iterative evaluation, each newly computed node is appended to a workspace-owned `active` vector after its prerequisites. Reversing this order is a valid reverse topological sweep for all actually visited nodes, even when outputs share intermediate dependencies. VJP therefore no longer scans nodes excluded by lazy conditional execution. Both active-node and adjoint buffers are reused. The scratch array capacities can be inspected for regression testing, but this is not an allocator-level proof. Benchmark scalar execution separately from branch-heavy cases; active-vector writes may cost performance on fully active graphs. No Rust CI results are available yet.

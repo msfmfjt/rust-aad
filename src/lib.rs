@@ -85,12 +85,12 @@ impl CompiledGraph {
     pub fn workspace(&self)->Workspace{Workspace {
         primal:vec![0.0;self.nodes.len()], adjoint:vec![0.0;self.nodes.len()],
         visited:vec![false;self.nodes.len()], output:vec![0.0;self.outputs.len()],
-        input_adjoints:vec![0.0;self.input_count], stack:Vec::with_capacity(self.nodes.len().saturating_mul(3)), graph_id:self.graph_id,
+        input_adjoints:vec![0.0;self.input_count], stack:Vec::with_capacity(self.nodes.len().saturating_mul(3)), active:Vec::with_capacity(self.nodes.len()), graph_id:self.graph_id,
     }}
     fn preflight(&self,inputs:&[f64],w:&Workspace)->Result<(),AadError>{
         if inputs.len()!=self.input_count{return Err(AadError::InputShape)}
         if inputs.iter().any(|v|!v.is_finite()){return Err(AadError::NonFiniteInput)}
-        if w.graph_id!=self.graph_id || w.primal.len()!=self.nodes.len()||w.adjoint.len()!=self.nodes.len()||w.visited.len()!=self.nodes.len()||w.output.len()!=self.outputs.len()||w.input_adjoints.len()!=self.input_count {
+        if w.graph_id!=self.graph_id || w.primal.len()!=self.nodes.len()||w.adjoint.len()!=self.nodes.len()||w.visited.len()!=self.nodes.len()||w.active.capacity()<self.nodes.len()||w.output.len()!=self.outputs.len()||w.input_adjoints.len()!=self.input_count {
             return Err(AadError::InvalidWorkspace)
         }
         Ok(())
@@ -149,12 +149,15 @@ impl CompiledGraph {
             if !value.is_finite(){w.stack.clear();return Err(AadError::NonFiniteResult{node:i})}
             w.primal[i]=value;
             w.visited[i]=true;
+            // Forward executes dependencies before consumers. This execution-order
+            // trace is reverse-topological, even for lazy branches and shared DAGs.
+            w.active.push(i);
         }
         Ok(w.primal[id.0])
     }
     /// Evaluate all outputs. The workspace owns returned values; each call overwrites them.
     pub fn evaluate<'a>(&self,inputs:&[f64],w:&'a mut Workspace)->Result<&'a [f64],AadError>{
-        self.preflight(inputs,w)?;w.visited.fill(false);w.stack.clear();
+        self.preflight(inputs,w)?;w.visited.fill(false);w.stack.clear();w.active.clear();
         for (k,&id) in self.outputs.iter().enumerate(){w.output[k]=self.eval(id,inputs,w)?;}
         Ok(&w.output)
     }
@@ -166,8 +169,9 @@ impl CompiledGraph {
         self.evaluate(inputs,w)?;
         w.adjoint.fill(0.0);w.input_adjoints.fill(0.0);
         for (&o,&seed) in self.outputs.iter().zip(output_seeds){w.adjoint[o.0]+=seed;}
-        for i in (0..self.nodes.len()).rev(){
-            if !w.visited[i]{continue}
+        // Only reverse nodes executed on this invocation. A large inactive
+        // branch has no sweep cost; active storage is reused across calls.
+        for &i in w.active.iter().rev(){
             let seed=w.adjoint[i];if seed==0.0{continue}
             let p=&w.primal;
             match self.nodes[i]{
@@ -195,4 +199,37 @@ impl CompiledGraph {
     }
 }
 /// Mutable per-worker cache. Do not share between concurrent evaluations.
-pub struct Workspace { primal:Vec<f64>,adjoint:Vec<f64>,visited:Vec<bool>,output:Vec<f64>,input_adjoints:Vec<f64>,stack:Vec<(NodeId,u8)>,graph_id:u64 }
+pub struct Workspace { primal:Vec<f64>,adjoint:Vec<f64>,visited:Vec<bool>,output:Vec<f64>,input_adjoints:Vec<f64>,stack:Vec<(NodeId,u8)>,active:Vec<usize>,graph_id:u64 }
+
+/// Observable allocation capacities for regression tests; these are not byte-accurate
+/// allocator measurements and do not guarantee allocation-free execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceCapacities {
+    pub primal: usize,
+    pub adjoint: usize,
+    pub visited: usize,
+    pub output: usize,
+    pub input_adjoints: usize,
+    pub stack: usize,
+    pub active: usize,
+}
+
+impl Workspace {
+    #[must_use]
+    pub fn capacities(&self) -> WorkspaceCapacities {
+        WorkspaceCapacities {
+            primal: self.primal.capacity(),
+            adjoint: self.adjoint.capacity(),
+            visited: self.visited.capacity(),
+            output: self.output.capacity(),
+            input_adjoints: self.input_adjoints.capacity(),
+            stack: self.stack.capacity(),
+            active: self.active.capacity(),
+        }
+    }
+
+    /// Number of nodes executed by the most recent forward or VJP call.
+    #[must_use]
+    pub fn executed_nodes(&self) -> usize { self.active.len() }
+}
+

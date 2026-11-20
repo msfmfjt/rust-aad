@@ -115,3 +115,59 @@ fn workspace_must_belong_to_compiled_graph_even_when_shapes_match() {
     let mut w=g1.workspace();
     assert_eq!(g2.evaluate(&[1.0],&mut w).unwrap_err(), AadError::InvalidWorkspace);
 }
+
+#[test]
+fn reverse_uses_only_executed_nodes_and_reuses_scratch() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let zero = b.constant(0.0).unwrap();
+    let positive = b.greater(x, zero).unwrap();
+    // This costly branch is invalid for x < 0 and must not run or be reversed.
+    let mut expensive = b.ln(x).unwrap();
+    for _ in 0..10_000 {
+        expensive = b.exp(expensive).unwrap();
+        expensive = b.ln(expensive).unwrap();
+    }
+    let safe = b.neg(x).unwrap();
+    let result = b.select(positive, expensive, safe).unwrap();
+    let g = b.compile(&[result]).unwrap();
+    let mut w = g.workspace();
+    let original = w.capacities();
+    for _ in 0..100 {
+        assert_eq!(g.vjp(&[-2.0], &[1.0], &mut w).unwrap(), &[-1.0]);
+        assert!(w.executed_nodes() < 10);
+        assert_eq!(w.capacities(), original);
+    }
+    assert_eq!(g.vjp(&[1.0], &[1.0], &mut w).unwrap(), &[1.0]);
+    assert!(w.executed_nodes() > 20_000);
+    assert_eq!(w.capacities(), original);
+    assert_eq!(g.vjp(&[-2.0], &[1.0], &mut w).unwrap(), &[-1.0]);
+    assert!(w.executed_nodes() < 10);
+}
+
+#[test]
+fn shared_graph_multi_output_seeds_accumulate_and_reset() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let y = b.input();
+    let shared = b.mul(x, y).unwrap();
+    let twice = b.add(shared, shared).unwrap();
+    let g = b.compile(&[shared, twice, shared]).unwrap();
+    let mut w = g.workspace();
+    assert_eq!(g.vjp(&[2.0, 3.0], &[1.0, 2.0, 3.0], &mut w).unwrap(), &[24.0, 16.0]);
+    assert_eq!(g.vjp(&[2.0, 3.0], &[0.0, 1.0, 0.0], &mut w).unwrap(), &[6.0, 4.0]);
+    assert_eq!(w.executed_nodes(), g.node_count());
+}
+
+#[test]
+fn failed_branch_does_not_poison_next_workspace_call() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let one = b.constant(1.0).unwrap();
+    let z = b.ln(x).unwrap();
+    let result = b.add(z, one).unwrap();
+    let g = b.compile(&[result]).unwrap();
+    let mut w = g.workspace();
+    assert!(matches!(g.vjp(&[-1.0], &[1.0], &mut w), Err(AadError::NonFiniteResult { .. })));
+    assert_eq!(g.vjp(&[1.0], &[1.0], &mut w).unwrap(), &[1.0]);
+}

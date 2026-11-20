@@ -45,7 +45,7 @@ See [architecture](docs/architecture.md) and [benchmark plan](docs/benchmarks.md
 
 - Branches are lazy: inactive domain-invalid branches are not evaluated. For `select`, zero means false and any nonzero value means true; there is no adjoint to the selection condition.
 - `min`/`max` break ties to the left input. No special pathwise derivative is implied for digital discontinuities.
-- This prototype currently uses recursive interpretation (maximum permitted graph nodes is not a stack-depth guarantee). Deep graphs require an explicit iterative scheduler before production use.
+- Evaluation uses an iterative task stack instead of Rust recursion. Deep-graph tests exist, but successful compilation and platform behavior still require CI validation.
 - Division reverse uses the straightforward formula and does not yet include the Pricing Library's scaled arithmetic for extreme exponents.
 - Input validation rejects nonfinite values. The gradient seed and intermediate errors are checked but extreme cancellation/overflow paths require more adversarial testing.
 - The core forbids unsafe Rust and has no C++/Python dependencies.
@@ -58,8 +58,14 @@ MIT OR Apache-2.0.
 
 GitHub Actions tests on Linux, macOS, and Windows. Once this source is pushed to GitHub, open **Actions → Rust CI → Run workflow** to run a manual Linux interpreter-only benchmark and retrieve `aad-baseline-linux`. GitHub-hosted runner results are smoke measurements, not stable performance comparison evidence. The benchmark is run locally with `cargo run --release --example baseline -- 100000`.
 
-The immutable graph's `NodeId`s now include a builder identity to reject nodes belonging to a different graph; VJP rejects nonfinite intermediate adjoint arrays. This is still a prototype, with recursive evaluation and no validated AADC parity.
+Graph-local `NodeId`s reject foreign handles; VJP checks nonfinite adjoints. Evaluation is iterative, and the active execution trace is reused by the reverse sweep. No validated AADC parity is claimed.
 
 ## Development status (iterative graph evaluator)
 
 Graph evaluation now uses an explicit per-workspace stack rather than recursive Rust calls, preserving lazy selection of the active branch. Workspace identity is checked against the compiled graph, and regression tests cover deep graphs. The project is still experimental and has **not** demonstrated AADC-comparable performance. A Rust toolchain and CI run are required to validate compilation and behavior.
+
+## Reverse workspace and active-path sweep (experimental)
+
+`CompiledGraph::workspace()` preallocates the primal, adjoint, input-gradient, iterative evaluation stack and active-node buffers. Each forward call clears the active trace and records executed nodes in dependency-first order. VJP traverses only this active trace in reverse, rather than scanning every compiled node. A large branch not selected at runtime is not visited in reverse. `Workspace::executed_nodes()` and `Workspace::capacities()` expose simple diagnostics for regression tests; capacities alone do not prove zero allocations by the system allocator.
+
+The numeric semantics (tie-breaking for `min/max`, pathwise derivative through the chosen select branch, and error handling) remain experimental. The project has not yet been built or benchmarked in this conversation; CI execution is still required.
