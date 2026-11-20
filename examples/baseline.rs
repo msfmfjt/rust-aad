@@ -40,10 +40,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sum += black_box(graph.vjp(black_box(&[s]), &[1.0], &mut ws)?[0]);
         }
         let reverse_ns = start.elapsed().as_nanos() as u64;
-        if repetition > 0 { forward.push(forward_ns); reverse.push(reverse_ns); }
+        if repetition > 0 {
+            forward.push(forward_ns);
+            reverse.push(reverse_ns);
+        }
     }
     forward.sort_unstable();
     reverse.sort_unstable();
-    println!("{{\"benchmark\":\"asian32_interpreter\",\"paths\":{paths},\"nodes\":{},\"forward_median_ns\":{},\"forward_vjp_median_ns\":{},\"checksum\":{sum:.12}}}", graph.node_count(),forward[3],reverse[3]);
+    println!(
+        "{{\"benchmark\":\"asian32_interpreter\",\"paths\":{paths},\"nodes\":{},\"forward_median_ns\":{},\"forward_vjp_median_ns\":{},\"checksum\":{sum:.12}}}",
+        graph.node_count(),
+        forward[3],
+        reverse[3]
+    );
     Ok(())
 }

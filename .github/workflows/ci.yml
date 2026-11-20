@@ -1,8 +1,12 @@
 name: Rust CI
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -18,10 +22,14 @@ jobs:
           components: rustfmt, clippy
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Build all targets
+        run: cargo build --locked --workspace --all-targets --all-features
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --locked --workspace --all-targets --all-features
+      - name: Doc tests
+        run: cargo test --locked --workspace --doc --all-features
       - name: Documentation
         run: cargo doc --no-deps
 
