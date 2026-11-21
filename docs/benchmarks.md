@@ -67,8 +67,7 @@ scheduling as well as packed arithmetic.
 PR runs retain the four records and host/toolchain metadata per OS as
 `affine32-<os>` artifacts. For an AADC or XAD comparison, record the actual
 library version and compiler/optimization flags, repeat on the same host and
-report recording/JIT costs separately. The repository currently measures Rust
-backends only.
+report recording/JIT costs separately. The local matrix and XAD tape replay below extend this original fixture.
 
 ## Local benchmark matrix
 
@@ -204,7 +203,8 @@ all native risks over 64 independent antithetic units. These are measurements
 of the existing Pricing Library implementations.
 
 Full records include individual samples, intervals, memory and numerical
-outputs. The Rust matrices are gzipped JSON Lines. The application fixture and
+outputs. The Rust matrices are gzipped JSON Lines and can be passed directly to
+`benchmarks/compare.py`. The application fixture and
 native comparison sources are on the separate Pricing integration PR.
 
 - [Generic Rust measurements](../benchmarks/evidence/m3-max-2026-11-21/local-rust.jsonl.gz)

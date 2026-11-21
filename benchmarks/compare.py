@@ -2,6 +2,7 @@
 """Compare measured medians after checking workload identity and environment."""
 import argparse
 import csv
+import gzip
 import json
 import math
 from pathlib import Path
@@ -17,7 +18,8 @@ IDENTITY = ("schema", "paths", "workload", "inputs", "nodes", "seeds", "input_fn
 
 def load(path, backend):
     records = {}
-    with path.open() as stream:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8") as stream:
         for line in stream:
             r = json.loads(line)
             if r["backend"] != backend:
