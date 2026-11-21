@@ -17,11 +17,17 @@ fn check(
     let count = optimized.executed_nodes();
     let vjp = graph.vjp(inputs, seeds, optimized).map(bits);
 
-    let blocks = std::mem::take(&mut graph.straight_line.as_mut().unwrap().blocks);
+    let schedule = graph.straight_line.as_mut().unwrap();
+    let blocks = std::mem::take(&mut schedule.blocks);
+    let chain = schedule.sum_chain.take();
+    let covered = std::mem::replace(&mut schedule.covers_all_inputs, false);
     assert_eq!(value, graph.evaluate(inputs, reference).map(bits));
     assert_eq!(count, reference.executed_nodes());
     assert_eq!(vjp, graph.vjp(inputs, seeds, reference).map(bits));
-    graph.straight_line.as_mut().unwrap().blocks = blocks;
+    let schedule = graph.straight_line.as_mut().unwrap();
+    schedule.blocks = blocks;
+    schedule.sum_chain = chain;
+    schedule.covers_all_inputs = covered;
     vjp.map(|_| ())
 }
 
@@ -130,4 +136,71 @@ fn dot_preserves_overlapping_operands_shared_products_and_first_failing_node() {
         &[-0.0; 19],
     )
     .unwrap();
+}
+
+#[test]
+fn scalar_chain_matches_primitive_rounding_ties_seeds_and_cold_errors() {
+    let mut b = GraphBuilder::new();
+    let x: Vec<_> = (0..17).map(|_| b.input()).collect();
+    let bias = b.constant(-0.5).unwrap();
+    let q = b.constant(-1.0 / 3.0).unwrap();
+    let hi = b.constant(0.75).unwrap();
+    let mut s = bias;
+    for i in x {
+        s = b.add(s, i).unwrap();
+    }
+    s = b.sub(s, bias).unwrap();
+    s = b.min(s, hi).unwrap();
+    s = b.max(s, bias).unwrap();
+    s = b.mul(s, q).unwrap();
+    s = b.add(s, bias).unwrap();
+    s = b.mul(s, q).unwrap();
+    let mut g = b.compile(&[s]).unwrap();
+    assert!(g.straight_line.as_ref().unwrap().sum_chain.is_some());
+    let (mut w, mut reference) = (g.workspace(), g.workspace());
+    let mut state = 43_u64;
+    for _ in 0..1024 {
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            f64::from_bits((1023u64 << 52) | (state >> 12)) - 1.5
+        };
+        let row: [f64; 17] = std::array::from_fn(|_| next());
+        check(&mut g, &mut w, &mut reference, &row, &[next()]).unwrap();
+    }
+    for v in [0.75, -0.5, 0.0, -0.0, 1e190] {
+        let mut row = [0.0; 17];
+        row[0] = v;
+        for seed in [-0.0, 1.0, -1.0, 1e180, 2.0, 2.0, f64::from_bits(1)] {
+            check(&mut g, &mut w, &mut reference, &row, &[seed]).unwrap();
+        }
+    }
+    let mut row = [f64::MAX; 17];
+    assert!(matches!(
+        check(&mut g, &mut w, &mut reference, &row, &[0.0]),
+        Err(AadError::NonFiniteResult { .. })
+    ));
+    row[16] = f64::NAN;
+    assert_eq!(
+        check(&mut g, &mut w, &mut reference, &row, &[0.0]),
+        Err(AadError::NonFiniteInput)
+    );
+    check(&mut g, &mut w, &mut reference, &[0.0; 17], &[1.0]).unwrap();
+}
+
+#[test]
+fn cancelling_primals_still_check_shared_constant_adjoints() {
+    let mut b = GraphBuilder::new();
+    let x: Vec<_> = (0..8).map(|_| b.input()).collect();
+    let c = b.constant(0.0).unwrap();
+    let sum = x.into_iter().fold(c, |s, i| b.add(s, i).unwrap());
+    let out = b.add(sum, c).unwrap();
+    let mut g = b.compile(&[out]).unwrap();
+    assert!(g.straight_line.as_ref().unwrap().sum_chain.is_some());
+    let (mut w, mut reference) = (g.workspace(), g.workspace());
+    check(&mut g, &mut w, &mut reference, &[0.0; 8], &[1.0]).unwrap();
+    assert_eq!(
+        check(&mut g, &mut w, &mut reference, &[0.0; 8], &[f64::MAX]),
+        Err(AadError::NonFiniteResult { node: c.0 })
+    );
+    check(&mut g, &mut w, &mut reference, &[0.0; 8], &[1.0]).unwrap();
 }

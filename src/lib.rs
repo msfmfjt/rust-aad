@@ -8,7 +8,9 @@ use std::{
 };
 
 mod blocks;
+mod sum_chain;
 use blocks::Block;
+use sum_chain::SumChain;
 
 #[cfg(feature = "simd")]
 mod batch;
@@ -243,9 +245,20 @@ impl GraphBuilder {
         for &o in outputs {
             self.check(o)?;
         }
-        let straight_line = straight_line_order(&self.nodes, outputs).map(|order| StaticSchedule {
-            blocks: Block::compile(&self.nodes, outputs, &order),
-            order,
+        let straight_line = straight_line_order(&self.nodes, outputs).map(|order| {
+            let blocks = Block::compile(&self.nodes, outputs, &order);
+            let covers_all_inputs = order
+                .iter()
+                .filter(|&&i| matches!(self.nodes[usize::from(i)], Op::Input(_)))
+                .count()
+                == self.input_count;
+            let sum_chain = SumChain::compile(&self.nodes, outputs, &blocks, self.input_count);
+            StaticSchedule {
+                sum_chain,
+                order,
+                blocks,
+                covers_all_inputs,
+            }
         });
         Ok(CompiledGraph {
             straight_line,
@@ -258,6 +271,8 @@ impl GraphBuilder {
 }
 
 struct StaticSchedule {
+    sum_chain: Option<SumChain>,
+    covers_all_inputs: bool,
     order: Box<[u16]>,
     blocks: Box<[Block]>,
 }
@@ -295,6 +310,7 @@ impl CompiledGraph {
             stack: Vec::with_capacity(dynamic_nodes),
             active: Vec::with_capacity(dynamic_nodes),
             static_executed: 0,
+            uniform_gradient: Some(0.0),
             graph_id: self.graph_id,
         }
     }
@@ -302,7 +318,15 @@ impl CompiledGraph {
         if inputs.len() != self.input_count {
             return Err(AadError::InputShape);
         }
-        if inputs.iter().any(|v| !v.is_finite()) {
+        // A completed static schedule checks each reachable input. On error we
+        // still check all inputs before reporting a workspace or node error.
+        if (w.graph_id != self.graph_id
+            || !self
+                .straight_line
+                .as_ref()
+                .is_some_and(|s| s.covers_all_inputs))
+            && inputs.iter().any(|v| !v.is_finite())
+        {
             return Err(AadError::NonFiniteInput);
         }
         // Workspace fields are private and can only be created by this graph.
@@ -367,13 +391,12 @@ impl CompiledGraph {
         order: &[u16],
         inputs: &[f64],
         w: &mut Workspace,
-    ) -> Result<(), AadError> {
+    ) -> Result<(), usize> {
         for (completed, &slot) in order.iter().enumerate() {
             let i = usize::from(slot);
             let value = self.nodes[i].value(inputs, &w.primal);
             if !value.is_finite() {
-                w.static_executed = completed;
-                return Err(AadError::NonFiniteResult { node: i });
+                return Err(completed);
             }
             w.primal[i] = value;
         }
@@ -387,8 +410,32 @@ impl CompiledGraph {
     ) -> Result<&'a [f64], AadError> {
         self.preflight(inputs, w)?;
         if let Some(schedule) = &self.straight_line {
+            if let Some((value, _)) = schedule
+                .sum_chain
+                .as_ref()
+                .and_then(|chain| chain.evaluate(inputs))
+            {
+                w.output[0] = value;
+                w.static_executed = schedule.order.len();
+                return Ok(&w.output);
+            }
+        }
+        self.evaluate_graph(inputs, w)?;
+        Ok(&w.output)
+    }
+
+    fn evaluate_graph(&self, inputs: &[f64], w: &mut Workspace) -> Result<(), AadError> {
+        if let Some(schedule) = &self.straight_line {
             if schedule.blocks.is_empty() || !self.evaluate_blocks(schedule, inputs, w) {
-                self.evaluate_slots(&schedule.order, inputs, w)?;
+                if let Err(completed) = self.evaluate_slots(&schedule.order, inputs, w) {
+                    if schedule.covers_all_inputs && inputs.iter().any(|v| !v.is_finite()) {
+                        return Err(AadError::NonFiniteInput);
+                    }
+                    w.static_executed = completed;
+                    return Err(AadError::NonFiniteResult {
+                        node: usize::from(schedule.order[completed]),
+                    });
+                }
             }
             w.static_executed = schedule.order.len();
             for (value, id) in w.output.iter_mut().zip(&self.outputs) {
@@ -402,7 +449,7 @@ impl CompiledGraph {
                 w.output[k] = self.eval(id, inputs, w)?;
             }
         }
-        Ok(&w.output)
+        Ok(())
     }
     /// Vector-Jacobian product: J(inputs)^T * output_seeds. Multiple outputs supported.
     pub fn vjp<'a>(
@@ -414,9 +461,30 @@ impl CompiledGraph {
         if output_seeds.len() != self.outputs.len() || output_seeds.iter().any(|v| !v.is_finite()) {
             return Err(AadError::SeedShape);
         }
-        self.evaluate(inputs, w)?;
+        self.preflight(inputs, w)?;
+        if let Some(schedule) = &self.straight_line {
+            if let Some((value, gradient)) = schedule
+                .sum_chain
+                .as_ref()
+                .and_then(|c| c.vjp(inputs, output_seeds[0]))
+            {
+                w.static_executed = schedule.order.len();
+                w.output[0] = value;
+                if w.uniform_gradient != Some(gradient) {
+                    w.input_adjoints.fill(gradient);
+                    w.uniform_gradient = Some(gradient);
+                }
+                return Ok(&w.input_adjoints);
+            }
+        }
+        self.evaluate_graph(inputs, w)?;
+        w.uniform_gradient = None;
         w.adjoint.fill(0.0);
-        w.input_adjoints.fill(0.0);
+        // Every reachable input in a static schedule overwrites its own gradient.
+        // A lazy path can omit inputs that were reached on the previous call.
+        if self.straight_line.is_none() {
+            w.input_adjoints.fill(0.0);
+        }
         for (&o, &seed) in self.outputs.iter().zip(output_seeds) {
             w.adjoint[o.0] += seed;
         }
@@ -441,6 +509,9 @@ impl CompiledGraph {
             let i = usize::from(slot);
             let seed = adj[i];
             if seed == 0.0 {
+                if let Op::Input(k) = self.nodes[i] {
+                    gradients[k] = 0.0;
+                }
                 continue;
             }
             // Every contribution targets an earlier executed node. Its final
@@ -449,7 +520,7 @@ impl CompiledGraph {
                 return Err(AadError::NonFiniteResult { node: i });
             }
             match self.nodes[i] {
-                Op::Input(k) => gradients[k] += seed,
+                Op::Input(k) => gradients[k] = seed,
                 Op::Constant(_) | Op::Greater(..) => {}
                 Op::Add(a, b) => {
                     adj[a] += seed;
@@ -507,6 +578,7 @@ pub struct Workspace {
     stack: Vec<u16>,
     active: Vec<u16>,
     static_executed: usize,
+    uniform_gradient: Option<f64>,
     graph_id: u64,
 }
 

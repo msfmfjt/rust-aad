@@ -276,10 +276,10 @@ impl CompiledGraph {
                                     node: slots.start + i,
                                 });
                             }
-                            *g += value;
+                            *g = 0.0 + value;
                         }
-                    } else if seed != 0.0 {
-                        w.input_adjoints[inputs.clone()].fill(seed);
+                    } else {
+                        w.input_adjoints[inputs.clone()].fill(0.0 + seed);
                     }
                     if seed != 0.0 {
                         w.adjoint[*initial] += seed;

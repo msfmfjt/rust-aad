@@ -54,3 +54,26 @@ They check the final sum for finiteness. Once an addition produces infinity or
 NaN, further additions cannot produce a finite value. A failed check replays
 the original schedule to locate the first failure and count the completed nodes.
 Reverse checks shared input adjoints in their original visit order.
+
+Static schedules record whether they visit every declared input. Each input
+then passes a finiteness check when it is read individually or as part of an
+ordered sum. A failed evaluation checks the inputs before reporting the
+original failing operation. Graphs with unreachable inputs or lazy branches
+continue to validate all inputs up front.
+
+For a single ordered sum followed by a single-output chain of add, subtract,
+multiply, minimum or maximum with right-hand constants, the scalar compiler
+records the constants and the multipliers in reverse order. A clamp selecting
+its constant cuts the derivative to the sum. Ties select the left operand.
+Every input has the same derivative, so a workspace can retain the last
+uniform gradient vector across calls. Each call reads its inputs and seed.
+
+The compiler bounds reverse growth by a power of two per multiplier and
+reserves enough exponent bits to add all contributions to a shared constant.
+The fast path checks the seed and each successive primal against the resulting
+limit. Outside that interval the primitive reverse rules also check adjoints
+at constant nodes and report the original error, if any.
+
+The two-lane arithmetic tape maps the ordered sum and dot-product blocks to
+its compact slots during preparation. It preserves multiplication and addition
+order independently in each lane, including for overlapping dot operands.

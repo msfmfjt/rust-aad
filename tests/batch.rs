@@ -82,3 +82,34 @@ fn reachable_unsupported_ops_use_scalar_lazy_semantics() {
     assert!(g.batch2().is_none());
     assert_eq!(g.evaluate(&[-1.0], &mut g.workspace()).unwrap(), &[0.0]);
 }
+
+#[test]
+fn reduced_pairs_preserve_primitive_error_order_and_workspace_reuse() {
+    let mut b = GraphBuilder::new();
+    let x: Vec<_> = (0..8).map(|_| b.input()).collect();
+    let zero = b.constant(0.0).unwrap();
+    let mut sum = zero;
+    let mut squares = zero;
+    for &input in &x {
+        sum = b.add(sum, input).unwrap();
+        let square = b.mul(input, input).unwrap();
+        squares = b.add(squares, square).unwrap();
+    }
+    let g = b.compile(&[sum, squares, sum]).unwrap();
+    let mut batch = g.batch2().unwrap();
+    let mut row = [[0.5, -1.0]; 8];
+    row[3][1] = 1e200;
+    assert_eq!(
+        batch.evaluate(&row),
+        Err(AadError::NonFiniteResult { node: 19 })
+    );
+    row[7][0] = f64::INFINITY;
+    assert_eq!(batch.evaluate(&row), Err(AadError::NonFiniteInput));
+    row = [[0.5, -1.0]; 8];
+    assert_eq!(
+        batch.vjp(&row, &[[0.0, f64::MAX], [0.0; 2], [0.0, f64::MAX]]),
+        Err(AadError::NonFiniteResult { node: 30 })
+    );
+    let seeds = [[0.5, -0.5], [-2.0, 3.0], [1.0, 1.0]];
+    assert_eq!(batch.vjp(&row, &seeds).unwrap(), &[[-0.5, -5.5]; 8]);
+}

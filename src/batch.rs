@@ -1,6 +1,8 @@
 //! Two independent f64 evaluations per instruction, using safe SIMD operations.
 use super::{AadError, CompiledGraph, Op};
 use wide::f64x2;
+mod reductions;
+use reductions::Region;
 
 #[derive(Clone, Copy)]
 enum Arithmetic {
@@ -21,6 +23,8 @@ struct Step {
 /// pair of independent path values. Prepare one executor per worker.
 pub struct Batch2 {
     steps: Vec<Step>,
+    regions: Box<[Region]>,
+    covers_all_inputs: bool,
     outputs: Vec<usize>,
     primal: Vec<f64x2>,
     adjoint: Vec<f64x2>,
@@ -33,7 +37,8 @@ impl CompiledGraph {
     /// add, subtract, multiply and negate nodes. Returns `None` for graphs
     /// requiring other operations. Those graphs can use the scalar workspace.
     pub fn batch2(&self) -> Option<Batch2> {
-        let order = &self.straight_line.as_ref()?.order;
+        let schedule = self.straight_line.as_ref()?;
+        let order = &schedule.order;
         let mut slots = vec![0; self.nodes.len()];
         let mut steps = Vec::with_capacity(order.len());
         for &source in order {
@@ -51,6 +56,12 @@ impl CompiledGraph {
             steps.push(Step { source_node: i, op });
         }
         Some(Batch2 {
+            regions: schedule
+                .blocks
+                .iter()
+                .map(|block| Region::prepare(block, &slots))
+                .collect(),
+            covers_all_inputs: schedule.covers_all_inputs,
             primal: vec![f64x2::ZERO; steps.len()],
             adjoint: vec![f64x2::ZERO; steps.len()],
             steps,
@@ -67,11 +78,30 @@ impl Batch2 {
         if inputs.len() != self.gradients.len() {
             return Err(AadError::InputShape);
         }
-        if !inputs.iter().flatten().all(|v| v.is_finite()) {
+        if !self.covers_all_inputs && !inputs.iter().flatten().all(|v| v.is_finite()) {
             return Err(AadError::NonFiniteInput);
         }
-        let p = &mut self.primal;
-        for (i, step) in self.steps.iter().enumerate() {
+        if self.regions.is_empty() || self.forward_regions(inputs).is_err() {
+            if let Err(error) = Self::forward_steps(&self.steps, 0, inputs, &mut self.primal) {
+                if self.covers_all_inputs && !inputs.iter().flatten().all(|v| v.is_finite()) {
+                    return Err(AadError::NonFiniteInput);
+                }
+                return Err(error);
+            }
+        }
+        for (value, &slot) in self.values.iter_mut().zip(&self.outputs) {
+            *value = self.primal[slot].to_array();
+        }
+        Ok(&self.values)
+    }
+
+    fn forward_steps(
+        steps: &[Step],
+        start: usize,
+        inputs: &[[f64; 2]],
+        p: &mut [f64x2],
+    ) -> Result<(), AadError> {
+        for (i, step) in steps.iter().enumerate() {
             let value = match step.op {
                 Arithmetic::Input(k) => f64x2::new(inputs[k]),
                 Arithmetic::Constant(v) => f64x2::splat(v),
@@ -86,14 +116,10 @@ impl Batch2 {
                     node: step.source_node,
                 });
             }
-            p[i] = value;
+            p[start + i] = value;
         }
-        for (value, &slot) in self.values.iter_mut().zip(&self.outputs) {
-            *value = p[slot].to_array();
-        }
-        Ok(&self.values)
+        Ok(())
     }
-
     /// Run forward and return one input-gradient vector per lane, using that
     /// lane's output seeds. Repeated output handles accumulate their seeds.
     pub fn vjp(
@@ -110,15 +136,29 @@ impl Batch2 {
         for (&o, &pair) in self.outputs.iter().zip(seeds) {
             adj[o] += f64x2::new(pair);
         }
-        for (i, step) in self.steps.iter().enumerate().rev() {
-            let seed = adj[i];
+        if self.regions.is_empty() {
+            Self::reverse_steps(&self.steps, 0, &self.primal, adj, &mut self.gradients)?;
+        } else {
+            self.reverse_regions()?;
+        }
+        Ok(&self.gradients)
+    }
+    fn reverse_steps(
+        steps: &[Step],
+        start: usize,
+        p: &[f64x2],
+        adj: &mut [f64x2],
+        gradients: &mut [[f64; 2]],
+    ) -> Result<(), AadError> {
+        for (i, step) in steps.iter().enumerate().rev() {
+            let seed = adj[start + i];
             if !seed.is_finite().all() {
                 return Err(AadError::NonFiniteResult {
                     node: step.source_node,
                 });
             }
             match step.op {
-                Arithmetic::Input(k) => self.gradients[k] = seed.to_array(),
+                Arithmetic::Input(k) => gradients[k] = seed.to_array(),
                 Arithmetic::Constant(_) => {}
                 Arithmetic::Add(a, b) => {
                     adj[a] += seed;
@@ -129,12 +169,12 @@ impl Batch2 {
                     adj[b] -= seed;
                 }
                 Arithmetic::Mul(a, b) => {
-                    adj[a] += seed * self.primal[b];
-                    adj[b] += seed * self.primal[a];
+                    adj[a] += seed * p[b];
+                    adj[b] += seed * p[a];
                 }
                 Arithmetic::Neg(a) => adj[a] -= seed,
             }
         }
-        Ok(&self.gradients)
+        Ok(())
     }
 }

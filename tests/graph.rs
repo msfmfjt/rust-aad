@@ -335,3 +335,27 @@ fn compact_schedule_accepts_the_last_representable_node() {
     assert_eq!(g.vjp(&[2.0], &[1.0], &mut w).unwrap(), &[-1.0]);
     assert_eq!(w.executed_nodes(), usize::from(u16::MAX) + 1);
 }
+
+#[test]
+fn nonfinite_input_precedes_node_failure_and_preserves_the_last_trace() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let y = b.input();
+    let log = b.ln(x).unwrap();
+    let out = b.add(log, y).unwrap();
+    let g = b.compile(&[out]).unwrap();
+    let mut w = g.workspace();
+    g.evaluate(&[1.0, 2.0], &mut w).unwrap();
+    let old = w.executed_nodes();
+    assert_eq!(
+        g.vjp(&[-1.0, f64::NAN], &[0.0], &mut w),
+        Err(AadError::NonFiniteInput)
+    );
+    assert_eq!(w.executed_nodes(), old);
+    assert_eq!(
+        g.evaluate(&[-1.0, 2.0], &mut w),
+        Err(AadError::NonFiniteResult { node: 2 })
+    );
+    assert_eq!(w.executed_nodes(), 1);
+    assert_eq!(g.vjp(&[1.0, 2.0], &[0.0], &mut w).unwrap(), &[0.0; 2]);
+}
