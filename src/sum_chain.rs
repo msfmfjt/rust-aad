@@ -1,7 +1,7 @@
 //! A scalar expression of one ordered input sum and constant operands.
 use crate::{Block, NodeId, Op};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Operator {
     Add,
     Sub,
@@ -15,7 +15,59 @@ struct Step {
     constant: f64,
 }
 
+#[derive(Clone, Copy)]
+struct AffineClamp {
+    scale: f64,
+    subtract: f64,
+    bound: f64,
+    floor: bool,
+}
+impl AffineClamp {
+    fn compile(mut steps: &[Step]) -> Option<Self> {
+        let mut take = |op| match steps.split_first() {
+            Some((step, rest)) if step.op == op => {
+                steps = rest;
+                Some(step.constant)
+            }
+            _ => None,
+        };
+        let scale = take(Operator::Mul).unwrap_or(1.0);
+        let subtract = take(Operator::Sub)
+            .or_else(|| take(Operator::Add).map(|value| -value))
+            .unwrap_or(0.0);
+        let (bound, floor) = match steps {
+            [step] if step.op == Operator::Min => (step.constant, false),
+            [step] if step.op == Operator::Max => (step.constant, true),
+            [] => (f64::NEG_INFINITY, true),
+            _ => return None,
+        };
+        Some(Self {
+            scale,
+            subtract,
+            bound,
+            floor,
+        })
+    }
+
+    #[inline]
+    fn apply(self, sum: f64, limit: f64) -> Option<(f64, bool)> {
+        let scaled = sum * self.scale;
+        let shifted = scaled - self.subtract;
+        if sum.abs() <= limit && scaled.abs() <= limit && shifted.abs() <= limit {
+            let (value, active) = if self.floor {
+                (shifted.max(self.bound), shifted >= self.bound)
+            } else {
+                (shifted.min(self.bound), shifted <= self.bound)
+            };
+            if value.abs() <= limit {
+                return Some((value, active));
+            }
+        }
+        None
+    }
+}
 pub(super) struct SumChain {
+    affine: Option<AffineClamp>,
     initial: f64,
     limit: f64,
     scales: Box<[f64]>,
@@ -79,6 +131,7 @@ impl SumChain {
         let exponent = 1023u32.checked_sub(growth + fan_in)? / 2;
         let limit = f64::from_bits(u64::from(1023 + exponent) << 52);
         Some(Self {
+            affine: AffineClamp::compile(&steps),
             initial,
             limit,
             scales,
@@ -93,7 +146,17 @@ impl SumChain {
     // A winning constant cuts the only path from the output to the sum.
     // A tie keeps the left operand, exactly as in primitive reverse execution.
     pub(super) fn evaluate(&self, inputs: &[f64]) -> Option<(f64, bool)> {
-        let mut value = crate::ordered_sum::ordered_sum(self.initial, inputs);
+        self.apply_sum(crate::ordered_sum::ordered_sum(self.initial, inputs))
+    }
+
+    pub(super) fn accepts_integer_sum(&self) -> bool {
+        self.initial == 0.0
+    }
+
+    pub(super) fn apply_sum(&self, mut value: f64) -> Option<(f64, bool)> {
+        if let Some(a) = self.affine {
+            return a.apply(value, self.limit);
+        }
         let mut active = true;
         if !self.within_bound(value) {
             return None;
@@ -120,10 +183,19 @@ impl SumChain {
     }
 
     pub(super) fn vjp(&self, inputs: &[f64], seed: f64) -> Option<(f64, f64)> {
+        self.vjp_from_sum(crate::ordered_sum::ordered_sum(self.initial, inputs), seed)
+    }
+
+    pub(super) fn vjp_from_sum(&self, sum: f64, seed: f64) -> Option<(f64, f64)> {
         if !self.within_bound(seed) {
             return None;
         }
-        let (value, active) = self.evaluate(inputs)?;
+        if let Some(a) = self.affine {
+            let (value, active) = a.apply(sum, self.limit)?;
+            let gradient = if active { seed * a.scale } else { 0.0 };
+            return Some((value, 0.0 + gradient));
+        }
+        let (value, active) = self.apply_sum(sum)?;
         // With bounded primals and seed, even all constant adjoints combined
         // remain finite. Out-of-range calls use the original checked schedule.
         let grad = if active {

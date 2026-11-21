@@ -50,6 +50,14 @@ fn main() {
         &[-1.0, 0.0]
     );
     check_reuse("error and recovery", region.change());
+    let data = rust_aad_core::PreparedInputs::new(2, 2, paths.as_flattened().to_vec()).unwrap();
+    let mut replay = data.replay(&graph).unwrap();
+    region.reset();
+    for i in 0..256 {
+        black_box(replay.evaluate(i % 2).unwrap());
+        black_box(replay.vjp(i % 2, &[1.0, 0.5]).unwrap());
+    }
+    check_reuse("256 prepared rows per method", region.change());
     check_straight_line();
     #[cfg(feature = "simd")]
     check_batch();
