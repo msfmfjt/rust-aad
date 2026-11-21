@@ -1,4 +1,4 @@
-use rust_aad_bench::{FNV_OFFSET, Scalar, Simd, fixture::Case, fnv, run};
+use rust_aad_bench::{FNV_OFFSET, Scalar, Simd, fixture::Case, fnv, run_with_output};
 use serde_json::json;
 use std::error::Error;
 use std::fs::{self, File};
@@ -76,17 +76,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         [flag, id, paths, dir] if flag == "--export" => {
             return fixture(id, size(paths)?, Some(Path::new(dir)));
         }
-        [backend, id, paths] => {
+        [backend, id, paths] | [backend, id, paths, _] => {
             case(id)?;
             let paths = size(paths)?;
-            let result = match backend.as_str() {
-                "rust-scalar" => run::<Scalar>(id, paths),
-                "rust-simd2" => run::<Simd>(id, paths),
+            let evaluate = match backend.as_str() {
+                "rust-scalar" => run_with_output::<Scalar>,
+                "rust-simd2" => run_with_output::<Simd>,
                 _ => return Err(format!("unknown backend {backend}").into()),
             };
+            let mut file = args.get(3).map(File::create_new).transpose()?.map(BufWriter::new);
+            let writer = file.as_mut().map(|f| f as &mut dyn Write);
+            let result = evaluate(id, paths, writer)?;
             println!("{result}");
         }
-        _ => return Err("usage: rust-aad-bench BACKEND ID PATHS | --describe ID | --fingerprint ID PATHS | --export ID PATHS NEW_DIRECTORY".into()),
+        _ => return Err("usage: rust-aad-bench BACKEND ID PATHS [NEW_OUTPUT.f64le] | --describe ID | --fingerprint ID PATHS | --export ID PATHS NEW_DIRECTORY".into()),
     }
     Ok(())
 }

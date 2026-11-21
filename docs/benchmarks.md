@@ -212,3 +212,56 @@ native comparison sources are on the separate Pricing integration PR.
 - [Native application measurements](../benchmarks/evidence/m3-max-2026-11-21/local-models.jsonl.gz)
 - [XAD tape measurements and build flags](../benchmarks/evidence/m3-max-2026-11-21/xad-tape.json)
 - [Pricing reference and application fixtures](https://github.com/msfmfjt/rust-pricing-library/tree/16799c5bfdac3be1e3a06fa996fe8e35836221ad/verification/standalone-aad)
+
+## Same-host comparison with an external compiled AD engine
+
+Start with 10,000 paths on each registered graph. The affine and width cases
+exercise multiple seeded outputs. The average and branch cases cover the
+payoff kink and lazy, domain-invalid arms. Restrict each paired timing to
+semantics and arithmetic both engines support. Compare scalar against scalar
+and report the best supported single-worker SIMD configuration separately.
+Run the two engines on the same physical host, without concurrent benchmark
+jobs. Record the CPU, OS, compiler, optimisation flags, SDK and engine
+versions, actual execution backend, lane count, worker count and binary or
+package digest. Record a fallback or unsupported operation explicitly.
+
+Use these two batch boundaries for a public batch API that materialises
+results. Inputs and seeds are prepacked, the workspace and destination arrays
+exist before the timer, and the timer covers all 10,000 paths.
+
+| Phase | Work completed before stopping the timer |
+|---|---|
+| `forward_store_outputs` | Compute and store all primal outputs, path-major |
+| `forward_vjp_store_gradients` | Evaluate primal and seeded reverse once, then store every input adjoint, path-major |
+
+One VJP seed per output defines the weighted sum. A full Jacobian requires
+different work. If a binding also returns primal outputs in the second phase,
+allocates returned arrays, or requires per-path language calls, record those
+costs. A timing with different output or allocation boundaries belongs in a
+separate API-level result. Keep initial recording, JIT compilation, workspace
+preparation, input packing and file I/O outside these two timers. Report
+setup and first use independently. Confirm actual compiled execution and
+separate any interpreter fallback.
+
+For example, run the following from the repository root with fresh output
+paths. The binary's optional final argument enables the two stored-result
+phases. It writes the last observed output and gradient for every path.
+
+```sh
+cargo +1.98.1 build --locked --release --manifest-path benchmarks/Cargo.toml
+BIN=benchmarks/target/release/rust-aad-bench
+"$BIN" --export affine32-v1 10000 affine-inputs
+"$BIN" rust-simd2 affine32-v1 10000 rust-results.f64le > rust-timing.json
+python3 benchmarks/check_replay.py affine-inputs rust-results.f64le
+```
+
+Pass the same `program.json`, `inputs.f64le` and seeds to the external
+driver. Check its path-major output using the last command with its result
+file. Match the graph and input digests against `benchmarks/fixtures.json`.
+For performance comparisons, retain one warm-up and 11 timed samples per
+phase per engine. Repeat in alternating engine order to assess run-order
+effects. Report both medians, raw samples and the ratio of medians with its
+direction specified. If setup is material, compare total time for a specified
+number of replays as measured setup plus that number times the warm batch
+time. Figures from other hardware or different workloads cannot establish
+performance parity on this matrix.

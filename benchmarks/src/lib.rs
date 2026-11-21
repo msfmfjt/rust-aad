@@ -4,6 +4,7 @@ use fixture::{Case, Op, Program};
 use rust_aad_core::{Batch2, CompiledGraph, GraphBuilder, Workspace};
 use serde_json::{Value, json};
 use std::hint::black_box;
+use std::io::{self, Write};
 #[cfg(not(feature = "count-allocations"))]
 use std::time::Instant;
 
@@ -132,7 +133,29 @@ pub fn measure<T>(units: usize, mut operation: impl FnMut() -> T) -> Value {
     }
 }
 
+/// Retain all path results in contiguous path-major order. For SIMD, the
+/// borrowed result is coordinate-major within each batch of lanes.
+fn store_batch(src: &[f64], dest: &mut [f64], width: usize, lanes: usize) {
+    if lanes == 1 {
+        dest.copy_from_slice(src);
+        return;
+    }
+    for (lane, row) in dest.chunks_exact_mut(width).enumerate() {
+        for (j, value) in row.iter_mut().enumerate() {
+            *value = src[j * lanes + lane];
+        }
+    }
+}
+
 pub fn run<B: Backend>(id: &str, paths: usize) -> Value {
+    run_with_output::<B>(id, paths, None).expect("no file I/O in the ordinary benchmark")
+}
+
+pub fn run_with_output<B: Backend>(
+    id: &str,
+    paths: usize,
+    retained: Option<&mut dyn Write>,
+) -> io::Result<Value> {
     let case = Case::parse(id).expect("unknown workload");
     let tolerance = if matches!(case, Case::Affine) {
         2e-13
@@ -213,9 +236,51 @@ pub fn run<B: Backend>(id: &str, paths: usize) -> Value {
             black_box(B::vjp(&graph, &mut w, black_box(x), black_box(&seeds)));
         }
     });
-    json!({"schema":1,"workload":id,"backend":B::NAME,"lanes":lanes,"paths":paths,"inputs":n,
+    let mut report = json!({"schema":1,"workload":id,"backend":B::NAME,"lanes":lanes,"paths":paths,"inputs":n,
         "nodes":p.nodes.len(),"seeds":p.seeds,"input_fnv1a64":format!("{hash:016x}"),
         "program_fnv1a64":format!("{:016x}",fnv(FNV_OFFSET,&serde_json::to_vec(&p).unwrap())),
         "verified_paths":paths,"output_means":sum_y,"input_vjp_means":sum_grad,
-        "phases":{"record_compile":compile,"prepare_workspace":prepare,"cold_record_vjp":cold,"forward":forward,"forward_vjp":reverse}})
+        "phases":{"record_compile":compile,"prepare_workspace":prepare,"cold_record_vjp":cold,"forward":forward,"forward_vjp":reverse}});
+    if let Some(writer) = retained {
+        let outputs = p.outputs.len();
+        let mut all_y = vec![0.; paths * outputs];
+        let mut all_g = vec![0.; paths * n];
+        let forward = measure(paths, || {
+            for (x, dest) in inputs
+                .chunks_exact(stride)
+                .zip(all_y.chunks_exact_mut(outputs * lanes))
+            {
+                store_batch(
+                    B::forward(&graph, &mut w, black_box(x)),
+                    dest,
+                    outputs,
+                    lanes,
+                );
+            }
+            black_box(&all_y);
+        });
+        let vjp = measure(paths, || {
+            for (x, dest) in inputs
+                .chunks_exact(stride)
+                .zip(all_g.chunks_exact_mut(stride))
+            {
+                store_batch(
+                    B::vjp(&graph, &mut w, black_box(x), black_box(&seeds)),
+                    dest,
+                    n,
+                    lanes,
+                );
+            }
+            black_box(&all_g);
+        });
+        for (outputs, gradient) in all_y.chunks_exact(outputs).zip(all_g.chunks_exact(n)) {
+            for v in outputs.iter().chain(gradient) {
+                writer.write_all(&v.to_le_bytes())?;
+            }
+        }
+        writer.flush()?;
+        report["retained_phases"] =
+            json!({"forward_store_outputs":forward,"forward_vjp_store_gradients":vjp});
+    }
+    Ok(report)
 }
