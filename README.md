@@ -97,10 +97,31 @@ Enable `--features simd` and call `CompiledGraph::batch2()` once per worker.
 The result owns a prepared two-lane tape. Pass one `[f64; 2]` per input to
 `evaluate`, or pass inputs and one seed pair per output to `vjp`. Lane 0 and
 lane 1 are independent paths. Dispatch an odd final path to the scalar workspace.
-The kernel supports reachable constants, inputs, add, subtract, multiply and
-negate. A graph with any other reachable operation returns `None`; use the
-scalar evaluator for lazy branches, scaled division and transcendental functions.
+For ordinary path-major inputs, `evaluate_rows(a, b)` and
+`vjp_rows(a, b, &seeds)` accept two f64 slices directly. On eligible ordered
+sums, each vector lane follows its path's original addition order. Other
+supported graphs interleave the two rows in reusable scratch space.
+`outputs()` provides both primal outputs after a successful VJP.
+The kernel supports reachable constants, inputs, addition, subtraction,
+multiplication, negation, minimum and maximum. Min/max ties send the seed to
+the left operand. Use the scalar evaluator for lazy branches, division and
+transcendental functions.
 
 The [local benchmark matrix](docs/benchmarks.md#local-benchmark-matrix) checks
 every path's values and adjoints, measures setup, forward, VJP, allocations and
 peak memory, and exports binary fixtures for reproducible replay.
+
+## Multiple VJPs and path totals
+
+When several output weight vectors refer to the same input row,
+`graph.linearize(row, &mut workspace)?` evaluates the graph once. The returned
+pullback exposes `outputs()` and accepts a new seed vector for each call to
+`vjp(&seeds)?`. Drop the pullback to reuse the workspace for the next row.
+The regular `graph.vjp` entry point computes a single weighted gradient.
+
+For an aggregate, initialize one total per input to zero and call
+`accumulate_gradient(&mut totals, gradient)?` on each borrowed VJP in path
+order. A shape mismatch or nonfinite sum leaves the accumulated prefix intact.
+The [single-worker measurements](docs/benchmarks.md#three-path-vjp-experiments)
+cover row-major SIMD, reverse sweeps with different weights, and aggregate
+gradient storage.
