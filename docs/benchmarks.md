@@ -463,3 +463,78 @@ cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --exa
 ```
 
 [Paired samples, numerical checks, result hashes, setup and allocation measurements](../benchmarks/evidence/m3-max-2026-11-21/ordered-fold.json.gz)
+
+## Losslessly prepared input paths on Apple M3 Max
+
+On macOS 27.0.1, one worker on an Apple M3 Max evaluated the registered
+`average-120-v1` workload with Rust 1.98.1 release binaries and default target
+flags. Both revisions read the same path-major inputs, preserve ordered f64
+semantics and return a borrowed output or gradient. We measured the merge
+commit `84fb9a5` and implementation `c8a628a`. Each cell below is the median
+of four process medians, each based on 11 timed evaluations after one warmup.
+The three binaries ran in varying order. Graph construction, input generation
+and oracle checks precede these timings.
+
+| Operation | Previous f64 | Current f64 | Prepared inputs | Previous / prepared |
+|---|---:|---:|---:|---:|
+| Forward, 1M paths | 19.259 ms | 16.420 ms | 7.207 ms | 2.67× |
+| Forward + VJP, 1M paths | 24.028 ms | 20.910 ms | 11.034 ms | 2.18× |
+| Forward + VJP, 10k paths | 0.239 ms | 0.207 ms | 0.109 ms | 2.20× |
+| Forward + VJP, 10k paths, write all gradients | 0.405 ms | 0.367 ms | 0.293 ms | 1.38× |
+
+The per-round warm VJP ratios for one million paths ranged from 2.14×
+to 2.19×. Every value in this fixture fits exactly on a common binary
+grid. Converting the existing `Vec<f64>` took 88.5 ms (median of four).
+Its 960 MB of inputs occupy 240 MB after conversion. Both buffers coexist
+during packing. The representation stores individual input values and can be
+shared by workers or different graphs. Every call reads its row and computes
+its result. An eligible scalar sum uses an integer reduction because every
+ordered prefix fits exactly. A different graph expands the row into worker
+scratch. Workspace construction allocates an additional zero-gradient array
+of eight bytes per input on sum-chain graphs.
+
+### Including the initial conversion
+
+These are separate wall-clock measurements starting from the original f64
+matrix. They include workspace construction, input conversion for the
+prepared path and the indicated number of full VJP sweeps. Timers stop before
+teardown. The output seed changes each sweep, cycling through 17 values from
++1 to −1. We alternate process order and report the median of four runs.
+
+| Sweeps of 1M paths | Previous f64 | Prepared inputs | Previous / prepared |
+|---:|---:|---:|---:|
+| 1 | 26.3 ms | 101.4 ms | 0.26× |
+| 8 | 194.0 ms | 180.0 ms | 1.08× |
+| 16 | 386.0 ms | 267.7 ms | 1.44× |
+| 256 | 6327.4 ms | 3011.7 ms | 2.10× |
+
+### Coverage and controls
+
+The 16 registered scalar and SIMD cases at 10k paths produced byte-identical
+output and gradient files across revisions. Their warm allocation counts
+were zero. With the ordinary slice API, the sum of their individual VJP
+medians was 38.96 ms before and 38.76 ms after (1.01×).
+The prepared executor checked all rows in the 11 scalar fixtures against the
+slice API with alternating seeds. Its warm forwards, VJPs and retained VJPs
+also allocated zero bytes. Benefits depend on the computation. For example,
+`width-100-v1` took 0.974 ms on the previous slice API
+and 1.110 ms using prepared inputs in a single 11-sample process.
+
+The full-precision control perturbs low significand bits in each input. It
+kept all 960 MB in f64 storage and took 54.08 ms per million-path VJP
+in one 11-sample process. The evidence also includes eight pairs of 10k-path
+slice-API runs with the existing variable-seed and full-precision controls.
+[Raw samples, allocation counts, binary hashes and per-case digests](../benchmarks/evidence/m3-max-2026-11-21/prepared-inputs.json.gz).
+
+Run from the repository root. Use `--features count-allocations` for a separate
+allocation run. To reproduce the setup-inclusive baseline, copy
+`benchmarks/examples/f64_sweeps.rs` and its `support/sweeps.rs` module into a
+checkout of `84fb9a5`, then run the last command there.
+
+```sh
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml -- rust-scalar average-120-v1 1000000
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example prepared -- average-120-v1 1000000
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example prepared -- average-120-v1 1000000 full
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example prepared -- --sweeps 1000000 256
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example f64_sweeps -- 1000000 256
+```
