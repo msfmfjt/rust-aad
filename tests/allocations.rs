@@ -58,6 +58,15 @@ fn main() {
         black_box(replay.vjp(i % 2, &[1.0, 0.5]).unwrap());
     }
     check_reuse("256 prepared rows per method", region.change());
+    let mut totals = [0.0; 2];
+    region.reset();
+    for i in 0..256 {
+        let mut pullback = graph.linearize(&paths[i % 2], &mut ws).unwrap();
+        for seeds in [[0.0, 1.0], [1.0, -0.5]] {
+            rust_aad_core::accumulate_gradient(&mut totals, pullback.vjp(&seeds).unwrap()).unwrap();
+        }
+    }
+    check_reuse("256 shared forwards and accumulated VJPs", region.change());
     check_straight_line();
     #[cfg(feature = "simd")]
     check_batch();
@@ -73,6 +82,12 @@ fn check_batch() {
     let region = Region::new(ALLOCATOR);
     for i in 0..256 {
         let x = [[i as f64, -(i as f64)]];
+        black_box(batch.evaluate_rows(&[x[0][0]], &[x[0][1]]).unwrap());
+        black_box(
+            batch
+                .vjp_rows(&[x[0][0]], &[x[0][1]], &[[0.5, -0.5], [1.0, 2.0]])
+                .unwrap(),
+        );
         black_box(batch.evaluate(&x).unwrap());
         black_box(batch.vjp(&x, &[[0.5, -0.5], [1.0, 2.0]]).unwrap());
     }

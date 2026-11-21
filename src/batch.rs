@@ -88,6 +88,11 @@ impl CompiledGraph {
 }
 
 impl Batch2 {
+    /// Both lanes' primal outputs after a successful forward or VJP.
+    pub fn outputs(&self) -> &[[f64; 2]] {
+        &self.values
+    }
+
     /// Evaluate two paths. A nonfinite value in either lane fails the call.
     pub fn evaluate(&mut self, inputs: &[[f64; 2]]) -> Result<&[[f64; 2]], AadError> {
         self.run_pairs(inputs, None)?;
