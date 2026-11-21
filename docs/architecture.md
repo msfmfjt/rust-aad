@@ -41,3 +41,16 @@ Tests include a 50,000-step dependency chain, an invalid inactive branch with 20
 ## Active execution trace for reverse (P1 iteration)
 
 Branch-free graphs store a single forward order on the compiled graph. The SIMD arithmetic executor uses it when preparing its tape. Lazy evaluation records the active order in the workspace for each path. Reversing either order visits every consumer before its dependencies. A node's adjoint is therefore final when it is visited, and the reverse interpreter checks it for finiteness at that point. This also covers repeated output seeds. The primal and adjoint arrays and the input-gradient buffer are reused across calls.
+
+The scalar compiler groups consecutive steps when they form an ordered sum
+of contiguous input slots or an ordered dot product over contiguous primal
+slots. Each group needs at least four terms. A graph output or another use of
+an intermediate ends the group at that intermediate. Shared inputs retain
+their primal values for other consumers. The dot product supports overlapping
+operand ranges, including sums of squares.
+
+The loops preserve the primitive multiply, add and adjoint accumulation order.
+They check the final sum for finiteness. Once an addition produces infinity or
+NaN, further additions cannot produce a finite value. A failed check replays
+the original schedule to locate the first failure and count the completed nodes.
+Reverse checks shared input adjoints in their original visit order.

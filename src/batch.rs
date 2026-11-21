@@ -33,7 +33,7 @@ impl CompiledGraph {
     /// add, subtract, multiply and negate nodes. Returns `None` for graphs
     /// requiring other operations. Those graphs can use the scalar workspace.
     pub fn batch2(&self) -> Option<Batch2> {
-        let order = self.straight_line.as_deref()?;
+        let order = &self.straight_line.as_ref()?.order;
         let mut slots = vec![0; self.nodes.len()];
         let mut steps = Vec::with_capacity(order.len());
         for &source in order {

@@ -7,6 +7,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+mod blocks;
+use blocks::Block;
+
 #[cfg(feature = "simd")]
 mod batch;
 #[cfg(feature = "simd")]
@@ -240,8 +243,12 @@ impl GraphBuilder {
         for &o in outputs {
             self.check(o)?;
         }
+        let straight_line = straight_line_order(&self.nodes, outputs).map(|order| StaticSchedule {
+            blocks: Block::compile(&self.nodes, outputs, &order),
+            order,
+        });
         Ok(CompiledGraph {
-            straight_line: straight_line_order(&self.nodes, outputs),
+            straight_line,
             nodes: self.nodes.into_boxed_slice(),
             outputs: outputs.into(),
             input_count: self.input_count,
@@ -250,9 +257,14 @@ impl GraphBuilder {
     }
 }
 
+struct StaticSchedule {
+    order: Box<[u16]>,
+    blocks: Box<[Block]>,
+}
+
 /// Immutable graph, shareable across workers. Each worker needs its own Workspace.
 pub struct CompiledGraph {
-    straight_line: Option<Box<[u16]>>,
+    straight_line: Option<StaticSchedule>,
     nodes: Box<[Op]>,
     outputs: Box<[NodeId]>,
     input_count: usize,
@@ -350,6 +362,23 @@ impl CompiledGraph {
             }
         }
     }
+    fn evaluate_slots(
+        &self,
+        order: &[u16],
+        inputs: &[f64],
+        w: &mut Workspace,
+    ) -> Result<(), AadError> {
+        for (completed, &slot) in order.iter().enumerate() {
+            let i = usize::from(slot);
+            let value = self.nodes[i].value(inputs, &w.primal);
+            if !value.is_finite() {
+                w.static_executed = completed;
+                return Err(AadError::NonFiniteResult { node: i });
+            }
+            w.primal[i] = value;
+        }
+        Ok(())
+    }
     /// Evaluate all outputs. The workspace owns returned values; each call overwrites them.
     pub fn evaluate<'a>(
         &self,
@@ -357,17 +386,11 @@ impl CompiledGraph {
         w: &'a mut Workspace,
     ) -> Result<&'a [f64], AadError> {
         self.preflight(inputs, w)?;
-        if let Some(order) = &self.straight_line {
-            for (completed, &slot) in order.iter().enumerate() {
-                let i = usize::from(slot);
-                let value = self.nodes[i].value(inputs, &w.primal);
-                if !value.is_finite() {
-                    w.static_executed = completed;
-                    return Err(AadError::NonFiniteResult { node: i });
-                }
-                w.primal[i] = value;
+        if let Some(schedule) = &self.straight_line {
+            if schedule.blocks.is_empty() || !self.evaluate_blocks(schedule, inputs, w) {
+                self.evaluate_slots(&schedule.order, inputs, w)?;
             }
-            w.static_executed = order.len();
+            w.static_executed = schedule.order.len();
             for (value, id) in w.output.iter_mut().zip(&self.outputs) {
                 *value = w.primal[id.0];
             }
@@ -397,11 +420,26 @@ impl CompiledGraph {
         for (&o, &seed) in self.outputs.iter().zip(output_seeds) {
             w.adjoint[o.0] += seed;
         }
-        // Each order contains only nodes visited during this forward pass.
-        let order = self.straight_line.as_deref().unwrap_or(&w.active);
+        match &self.straight_line {
+            Some(schedule) if !schedule.blocks.is_empty() => self.reverse_blocks(schedule, w)?,
+            other => {
+                let order = other.as_ref().map_or(w.active.as_slice(), |s| &s.order);
+                self.reverse_slots(order, &w.primal, &mut w.adjoint, &mut w.input_adjoints)?;
+            }
+        }
+        Ok(&w.input_adjoints)
+    }
+
+    fn reverse_slots(
+        &self,
+        order: &[u16],
+        p: &[f64],
+        adj: &mut [f64],
+        gradients: &mut [f64],
+    ) -> Result<(), AadError> {
         for &slot in order.iter().rev() {
             let i = usize::from(slot);
-            let seed = w.adjoint[i];
+            let seed = adj[i];
             if seed == 0.0 {
                 continue;
             }
@@ -410,41 +448,40 @@ impl CompiledGraph {
             if !seed.is_finite() {
                 return Err(AadError::NonFiniteResult { node: i });
             }
-            let p = &w.primal;
             match self.nodes[i] {
-                Op::Input(k) => w.input_adjoints[k] += seed,
+                Op::Input(k) => gradients[k] += seed,
                 Op::Constant(_) | Op::Greater(..) => {}
                 Op::Add(a, b) => {
-                    w.adjoint[a] += seed;
-                    w.adjoint[b] += seed;
+                    adj[a] += seed;
+                    adj[b] += seed;
                 }
                 Op::Sub(a, b) => {
-                    w.adjoint[a] += seed;
-                    w.adjoint[b] -= seed;
+                    adj[a] += seed;
+                    adj[b] -= seed;
                 }
                 Op::Mul(a, b) => {
-                    w.adjoint[a] += seed * p[b];
-                    w.adjoint[b] += seed * p[a];
+                    adj[a] += seed * p[b];
+                    adj[b] += seed * p[a];
                 }
                 Op::Div(a, b) => {
-                    w.adjoint[a] += seed / p[b];
-                    w.adjoint[b] += division_denominator_adjoint(seed, p[a], p[b]);
+                    adj[a] += seed / p[b];
+                    adj[b] += division_denominator_adjoint(seed, p[a], p[b]);
                 }
-                Op::Neg(a) => w.adjoint[a] -= seed,
-                Op::Exp(a) => w.adjoint[a] += seed * p[i],
-                Op::Ln(a) => w.adjoint[a] += seed / p[a],
+                Op::Neg(a) => adj[a] -= seed,
+                Op::Exp(a) => adj[a] += seed * p[i],
+                Op::Ln(a) => adj[a] += seed / p[a],
                 Op::Min(a, b) => {
                     if p[a] <= p[b] {
-                        w.adjoint[a] += seed
+                        adj[a] += seed
                     } else {
-                        w.adjoint[b] += seed
+                        adj[b] += seed
                     }
                 }
                 Op::Max(a, b) => {
                     if p[a] >= p[b] {
-                        w.adjoint[a] += seed
+                        adj[a] += seed
                     } else {
-                        w.adjoint[b] += seed
+                        adj[b] += seed
                     }
                 }
                 Op::Select {
@@ -453,11 +490,11 @@ impl CompiledGraph {
                     zero,
                 } => {
                     let selected = if p[condition] != 0.0 { positive } else { zero };
-                    w.adjoint[selected] += seed;
+                    adj[selected] += seed;
                 }
             }
         }
-        Ok(&w.input_adjoints)
+        Ok(())
     }
 }
 /// Mutable per-worker cache. Do not share between concurrent evaluations.
