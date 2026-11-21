@@ -1,6 +1,6 @@
 # rust-aad
 
-An **experimental** Rust reverse-mode AD library for reusable numerical computation graphs. The long-term research target is financial Monte Carlo throughput comparable to MatLogica AADC; **no such performance claim is currently substantiated**. XAD is an architecture reference, not a dependency.
+An **experimental** Rust reverse-mode AD library for reusable numerical computation graphs. It is designed for repeated value and gradient calculations in workloads such as financial Monte Carlo simulation.
 
 ## Status
 
@@ -58,11 +58,11 @@ MIT OR Apache-2.0.
 
 GitHub Actions tests on Linux, macOS, and Windows. Open **Actions → Rust CI → Run workflow** to run a manual Linux interpreter-only benchmark and retrieve `aad-baseline-linux`. GitHub-hosted runner results are smoke measurements, not stable performance comparison evidence. The benchmark is run locally with `cargo run --release --example baseline -- 100000`.
 
-Graph-local `NodeId`s reject foreign handles; VJP checks nonfinite adjoints. Evaluation is iterative, and the active execution trace is reused by the reverse sweep. No validated AADC parity is claimed.
+Graph-local `NodeId`s reject foreign handles; VJP checks nonfinite adjoints. Evaluation is iterative, and the active execution trace is reused by the reverse sweep.
 
 ## Development status (iterative graph evaluator)
 
-Conditional graphs execute jumps to the chosen branch and use a per-workspace return stack for shared expressions. Workspace identity is checked against the compiled graph, and regression tests cover deep graphs. The project is still experimental and has **not** demonstrated AADC-comparable performance.
+Conditional graphs execute jumps to the chosen branch and use a per-workspace return stack for shared expressions. Workspace identity is checked against the compiled graph, and regression tests cover deep graphs.
 
 ## Reverse workspace and active-path sweep (experimental)
 
@@ -93,4 +93,4 @@ scalar evaluator for lazy branches, scaled division and transcendental functions
 
 The [local benchmark matrix](docs/benchmarks.md#local-benchmark-matrix) checks
 every path's values and adjoints, measures setup, forward, VJP, allocations and
-peak memory, and exports binary fixtures for replay with other AD libraries.
+peak memory, and exports binary fixtures for reproducible replay.
