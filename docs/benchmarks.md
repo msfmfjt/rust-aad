@@ -408,3 +408,58 @@ cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --exa
 ```
 
 [Raw timings, setup costs, allocation counts, output digests and build identifiers](../benchmarks/evidence/m3-max-2026-11-21/checked-replay.json.gz)
+
+## Exact sums, repeated arithmetic and lazy branches on Apple M3 Max
+
+Against `081579f`, revision `34d57af` reduced the 120-observation,
+one-million-path forward + VJP from **52.39 to 23.90 ms (2.19×)**.
+Forward alone took 38.79 to 19.20 ms. Both builds ran the same scalar API on
+one worker with Rust 1.98.1, default release flags and macOS 27.0.1.
+
+| Forward + VJP workload | Paths | Before (ms) | After (ms) | Speedup |
+|---|---:|---:|---:|---:|
+| Scalar average, 120 observations | 1,000,000 | 52.395 | 23.898 | 2.19× |
+| Scalar average, 120 observations, copy every input gradient | 10,000 | 0.887 | 0.405 | 2.19× |
+| Scalar affine recurrence, two outputs | 10,000 | 4.257 | 1.116 | 3.81× |
+| Scalar lazy branch, 50% early exit | 10,000 | 5.661 | 3.905 | 1.45× |
+| Scalar sum and sum of squares, 1,000 inputs | 10,000 | 26.051 | 8.978 | 2.90× |
+| SIMD sum and sum of squares, 1,000 inputs | 10,000 | 26.743 | 12.091 | 2.21× |
+
+The original average fixture uses binary fractions on a common grid. Its
+inputs satisfy the runtime check for exact integer summation. At 10,000 paths
+with a different VJP seed per row, it took 0.754 to 0.334 ms (2.26×). A
+control filled the low 30 mantissa bits with deterministic pseudorandom data
+to exercise the floating-point fallback. With a unit seed, the control took
+0.519 to 0.540 ms. With varying seeds it took 0.754 to 0.802 ms. These
+represent 4% and 6% longer elapsed times. All control outputs and input
+adjoints passed the pathwise formula checks.
+
+Across the 16 registered 10,000-path cases, the sum of forward + VJP medians
+fell from 84.50 to 38.92 ms (2.17×). The geometric mean of the 16 speedups
+was 1.68×, with 1.60× across 11 scalar cases and 1.88× across five SIMD
+cases. The 12-observation scalar average took 7% longer for forward + VJP
+and 29% longer for forward alone. Compiling the 120-observation graph took
+3.13 to 4.35 µs in the million-path runs. At 50% early exit, branch graph
+compilation took 0.79 to 2.54 µs and workspace preparation requested 2,422
+bytes, down from 2,666.
+
+Each process ran a warm-up and 11 timed samples. Both the 10,000-path matrix
+and the million-path case used four pairs of processes with alternating
+binary order. Stored-gradient measurements used two pairs. The precision and
+seed controls used eight pairs each. Timings above are medians of process
+medians. The replay timers exclude setup and verification. Stored-result
+timers include copies into preallocated arrays and exclude file I/O.
+
+In separate allocation runs, both revisions produced byte-identical streams
+of values and VJPs at 10,000 paths for all 16 cases. All warm replay phases,
+including result storage, recorded zero allocations and reallocations.
+Use the existing release benchmark commands above to repeat the registered
+workloads. For the precision controls, use the example from `34d57af` in
+both builds and run these commands in each checkout.
+
+```sh
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example variable_seeds -- --full-precision --unit-seed
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example variable_seeds -- --full-precision
+```
+
+[Paired samples, numerical checks, result hashes, setup and allocation measurements](../benchmarks/evidence/m3-max-2026-11-21/ordered-fold.json.gz)
