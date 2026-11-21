@@ -148,3 +148,24 @@ python3 benchmarks/compare.py benchmarks/results/full.jsonl rust-scalar benchmar
 CSV ratios are left median divided by right median. Only common workloads
 with equal phase units appear. The one-batch cold measurements for different
 lane widths remain available separately in the original JSONL.
+
+### Public XAD tape replay
+
+The optional C++ driver runs the two-output affine fixture on the public XAD
+2.2.0 tape. XAD is built from a separate checkout. With CMake, a C++20
+compiler, and the benchmark binary built as above:
+
+```sh
+git clone --depth 1 --branch v2.2.0 https://github.com/auto-differentiation/xad.git /tmp/xad-2.2.0
+cmake -S benchmarks/xad -B /tmp/xad-affine -DXAD_SOURCE_DIR=/tmp/xad-2.2.0 -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/xad-affine --target xad-affine --config Release
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml -- --export affine32-v1 10000 /tmp/affine32-replay
+/tmp/xad-affine/xad-affine /tmp/affine32-replay /tmp/xad-output.f64le
+python3 benchmarks/check_replay.py /tmp/affine32-replay /tmp/xad-output.f64le
+```
+
+The driver validates both outputs and both input adjoints on every path. It
+reuses a tape object and records each path afresh. Its eleven timed sweeps
+include recording, forward evaluation, reverse and storing every path result.
+This differs from the Rust prepared-graph phases. The single-threaded snapshot
+below reports these phase boundaries separately.
