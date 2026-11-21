@@ -308,3 +308,50 @@ strategy. Their warm VJP medians ranged from nearly unchanged on affine to
 7% longer on the 100-input case.
 
 [Raw timings, setup and allocation counts, result digests and build metadata](../benchmarks/evidence/m3-max-2026-11-21/scalar-traversal.json.gz)
+
+## Ordered scalar sums and dot products on Apple M3 Max
+
+The 120-observation graph at one million paths took 830.31 ms for forward
+plus VJP at `68208da` and 172.58 ms at `d04989d`, a 4.81× throughput gain.
+This measures repeated evaluation of an already-compiled graph with one
+workspace. The compiler now recognizes runs of additions and dot products
+and emits loops that retain the original order of floating-point operations.
+
+| Scalar workload | Paths | Forward before → after (ms) | Forward + VJP before → after (ms) | VJP including forward, speedup |
+|---|---:|---:|---:|---:|
+| Average, 120 observations | 1,000,000 | 455.13 → 123.57 | 830.31 → 172.58 | 4.81× |
+| Average, 12 observations | 10,000 | 0.666 → 0.208 | 1.093 → 0.430 | 2.54× |
+| Sum and sum of squares, 100 inputs | 10,000 | 7.30 → 1.16 | 17.07 → 2.61 | 6.54× |
+| Sum and sum of squares, 1,000 inputs | 10,000 | 74.41 → 16.30 | 177.70 → 29.21 | 6.08× |
+| Lazy branch, 50% early exit | 10,000 | 4.26 → 4.23 | 6.12 → 5.56 | 1.10× |
+
+At 10,000 paths, the geometric mean of the per-case forward + VJP speedups
+was 2.06× across 11 scalar cases, 1.01× across five two-lane SIMD cases and
+1.65× across all 16. The one-input scalar average and width cases took
+2–3% longer. The scalar affine case stayed within 1%. Recording and compiling
+the 120-observation graph took 2.42 → 2.92 µs in the million-path runs.
+Preparing its scalar workspace requested 4,904 bytes in each revision.
+
+Both builds used Rust 1.98.1, the locked benchmark dependencies, the default
+release profile, and one worker on macOS 27.0.1. Each phase ran one warm-up
+and 11 timed samples per process. Each binary ran four times per 10,000-path
+case and twice on the million-path case. The starting binary alternated
+between rounds. Values above are medians of process medians. The replay
+timers exclude setup, input generation, validation and copying all path
+results into long-lived arrays.
+
+Every path's outputs and seeded input derivatives passed the independent
+numerical checks. Separate allocation-instrumented runs of all 16 cases at
+10,000 paths produced byte-identical result streams across revisions. Both
+versions recorded zero allocations and reallocations during repeated forward
+and VJP, including the phases that copied results into preallocated arrays.
+
+To repeat the million-path measurement, build and run the following at each
+revision on the same host. The JSON includes individual samples and setup times.
+
+```sh
+cargo +1.98.1 build --locked --release --manifest-path benchmarks/Cargo.toml
+benchmarks/target/release/rust-aad-bench rust-scalar average-120-v1 1000000
+```
+
+[All timing samples, allocation counts, result digests and build metadata](../benchmarks/evidence/m3-max-2026-11-21/scalar-reductions.json.gz)
