@@ -7,6 +7,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+mod aggregate;
+pub use aggregate::{AccumulationError, accumulate_gradient};
 mod blocks;
 mod lazy;
 mod moments;
