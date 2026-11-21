@@ -69,3 +69,71 @@ PR runs retain the four records and host/toolchain metadata per OS as
 library version and compiler/optimization flags, repeat on the same host and
 report recording/JIT costs separately. The repository currently measures Rust
 backends only.
+
+## Local benchmark matrix
+
+From the repository root, use Python 3.9+ and Rust 1.98.1 (stable).
+The runner builds a separate, locked benchmark package. The production crate
+keeps its existing dependencies and minimum Rust version.
+
+```sh
+python3 benchmarks/run.py --profile smoke --output benchmarks/results/smoke.jsonl
+python3 benchmarks/run.py --profile full --output benchmarks/results/full.jsonl
+```
+
+| Fixture ID | Full run | Computation and derivative |
+|---|---:|---|
+| `affine32-v1` | 10,000 paths | Two outputs and the seeded derivative specified above |
+| `average-{1,12,120}-v1` | 10,000, 100,000 and 1,000,000 paths for each observation count | Positive part of the average minus 100, left derivative operand on a tie |
+| `branch-{1,50,99}-v1` | 10,000 paths each | Twelve nested lazy selections, exactly 1%, 50% or 99% of paths hit an early exit. Inactive branches contain invalid logarithms |
+| `width-{1,10,100,1000}-v1` | 10,000 paths each | Sum and sum of squares, output seeds 0.5 and −0.25, all input sensitivities |
+
+Smoke uses 100 paths for each shape. The scalar backend covers all cases. The
+two-lane backend covers affine and width cases, which use supported arithmetic.
+The full matrix has 17 scalar and five SIMD records. The largest input matrix
+occupies 960 MB. Run cases sequentially on an idle host.
+
+Each JSON line describes one backend, graph and path count. Input and graph
+digests are checked against `benchmarks/fixtures.json`. Each output and seeded
+input adjoint on every path must agree with a separate formula before timing.
+The absolute tolerance is scaled by `1 + abs(reference)` with coefficient
+2e−13 for affine and 2e−12 elsewhere. Per-coordinate means are for inspection.
+
+The five phases are recording/compilation from the portable program, workspace
+preparation, fresh graph + workspace + first VJP on one native batch, warmed
+forward over all paths, and warmed forward including the full seeded reverse
+sweep. Data generation and validation are outside the timers. Each phase has
+one warm-up followed by 11 samples. The median interval uses the second and
+tenth order statistics (98.83% distribution-free coverage for an independent,
+continuous sample). Samples from one process can be correlated. The binary
+reports the original samples as well as the interval. The native batch has
+one scalar or two SIMD paths. RSS covers the entire timing process, including
+inputs and correctness checks. Requested heap allocation counts and bytes come
+from a separate instrumented release executable. They exclude allocator overhead.
+`environment` records the OS, CPU, compiler, release build overrides, source
+revision, dirty flag, lockfile and executable digests. The runner also accepts
+`--manifest`, `--binary` and `--backend` for Rust reference adapters implementing
+the same measurement and validation contract.
+
+### External replay
+
+Export a bundle into a new directory, for example:
+
+```sh
+cargo +1.98.1 run --locked --manifest-path benchmarks/Cargo.toml --release -- --export branch-50-v1 10000 branch-replay
+python3 benchmarks/check_replay.py branch-replay external-results.f64le
+```
+
+`program.json` lists nodes in dependency order, output indices and VJP seeds.
+Each node has one opcode and its zero-based operands or immediate literal.
+`greater` returns a zero or one and has zero adjoint. `select` evaluates only
+the chosen arm. `max` sends the adjoint to the left operand on a tie.
+`inputs.f64le` holds contiguous path-major rows of little-endian binary64.
+Emit one row per path containing all output values in program order followed
+by all derivatives of the seeded output sum in input order. The checker
+validates this stream against `expected.f64le` and rejects nonfinite, missing
+and trailing data. `manifest.json` records dimensions and the byte digests.
+Apply the same precision, graph, seeds and correctness gate before timing any
+external engine. Record its version, compilation settings, threading, SIMD
+width, timing boundary and any retaping in its report. Keep application-level
+calibration and model benchmarks in the separate Pricing Library.

@@ -90,3 +90,7 @@ lane 1 are independent paths. Dispatch an odd final path to the scalar workspace
 The kernel supports reachable constants, inputs, add, subtract, multiply and
 negate. A graph with any other reachable operation returns `None`; use the
 scalar evaluator for lazy branches, scaled division and transcendental functions.
+
+The [local benchmark matrix](docs/benchmarks.md#local-benchmark-matrix) checks
+every path's values and adjoints, measures setup, forward, VJP, allocations and
+peak memory, and exports binary fixtures for replay with other AD libraries.
