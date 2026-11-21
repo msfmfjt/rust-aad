@@ -355,3 +355,56 @@ benchmarks/target/release/rust-aad-bench rust-scalar average-120-v1 1000000
 ```
 
 [All timing samples, allocation counts, result digests and build metadata](../benchmarks/evidence/m3-max-2026-11-21/scalar-reductions.json.gz)
+
+## Scalar sum chains and two-lane reductions on Apple M3 Max
+
+At one million paths, the 120-observation graph took **173.22 → 52.25 ms**
+for a forward evaluation and seeded VJP, or **3.32×** the throughput of
+`a4e4d28`. Forward alone took 121.78 → 38.82 ms. The new core revision
+was `53c4b21`. Both release builds used Rust 1.98.1, one worker, default
+target flags and macOS 27.0.1.
+
+| Workload | Paths | Measurement | Before (ms) | After (ms) | Speedup |
+|---|---:|---|---:|---:|---:|
+| Scalar average, 120 inputs | 1,000,000 | Forward + VJP | 173.22 | 52.25 | 3.32× |
+| Scalar average, 120 inputs | 10,000 | Forward + VJP and copy every gradient | 1.864 | 0.902 | 2.07× |
+| Scalar average, 120 inputs | 10,000 | Forward + VJP with a different seed per path | 1.852 | 0.756 | 2.45× |
+| SIMD sum and sum of squares, 100 inputs | 10,000 | Forward + VJP | 11.454 | 2.715 | 4.22× |
+| SIMD sum and sum of squares, 1,000 inputs | 10,000 | Forward + VJP | 109.70 | 26.75 | 4.10× |
+| SIMD sum and sum of squares, one input | 10,000 | Forward + VJP | 0.181 | 0.201 | 0.90× |
+
+The registered average uses a unit seed and the ordinary VJP returns a
+workspace slice. Its derivatives are uniform across the inputs. The workspace
+rewrites the vector when its value changes. The copy run additionally wrote
+every gradient into a preallocated path-major array. The variable-seed
+example used the same graph and rows with seed `1 + path_index / 10000`,
+checking each gradient against the independently seeded formula before timing.
+
+Across the 16 registered 10,000-path cases, the sum of the forward + VJP
+medians fell from 182.02 to 84.46 ms (2.15×). Wide SIMD graphs contribute
+most of that time. Giving every case equal weight, the geometric mean speedup
+was 1.55× overall, 1.30× for 11 scalar cases and 2.27× for five SIMD cases.
+The three lazy scalar cases took roughly 1–3% longer. Preparing the 1,000-input
+SIMD executor requested 308,264 bytes across nine allocations, up from 304,120
+bytes across seven. All 16 workloads recorded zero warm allocations and
+reallocations in both builds, including the stored-result phases.
+
+Each process ran one warm-up and 11 samples per phase. The table uses the
+median of the process medians. The binaries ran in alternating order across
+four pairs per registered 10,000-path case, two pairs for the million-path
+case, two pairs for stored results, and eight pairs for variable seeds.
+Recording, workspace preparation, numerical checks and disk I/O were outside
+the replay timers. Every timed workload passed its pathwise numerical checks.
+At 10,000 paths, the complete value and VJP streams were byte-identical on
+each backend across revisions.
+
+Run the million-path case using the release command above. Supply a new
+output file as the last argument for the stored-result measurements. To run
+the variable-seed control, use the same example source at both revisions.
+
+```sh
+benchmarks/target/release/rust-aad-bench rust-scalar average-120-v1 10000 values-and-gradients.f64le
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example variable_seeds
+```
+
+[Raw timings, setup costs, allocation counts, output digests and build identifiers](../benchmarks/evidence/m3-max-2026-11-21/checked-replay.json.gz)
