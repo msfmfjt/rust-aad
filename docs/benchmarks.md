@@ -137,3 +137,14 @@ Apply the same precision, graph, seeds and correctness gate before timing any
 external engine. Record its version, compilation settings, threading, SIMD
 width, timing boundary and any retaping in its report. Keep application-level
 calibration and model benchmarks in the separate Pricing Library.
+
+Compare two complete local reports with the same host, compiler, build flags,
+verified fixtures and sample counts. For instance:
+
+```sh
+python3 benchmarks/compare.py benchmarks/results/full.jsonl rust-scalar benchmarks/results/full.jsonl rust-simd2
+```
+
+CSV ratios are left median divided by right median. Only common workloads
+with equal phase units appear. The one-batch cold measurements for different
+lane widths remain available separately in the original JSONL.

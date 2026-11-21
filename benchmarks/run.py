@@ -33,6 +33,13 @@ def host():
     if sys.platform == "darwin":
         cpu = output("sysctl", "-n", "machdep.cpu.brand_string")
         features = output("sysctl", "-n", "machdep.cpu.features")
+        if not features and platform.machine() == "arm64":
+            # Intel-compatible feature strings are empty on Apple Silicon.
+            names = ("neon", "arm.FEAT_FP16", "arm.FEAT_DotProd", "arm.FEAT_LSE")
+            features = " ".join(name for name in names if
+                               subprocess.run(["sysctl", "-n", "hw.optional." + name],
+                                              capture_output=True, text=True).stdout.strip() == "1")
+            features = features or "unknown"
     elif sys.platform.startswith("linux"):
         info = dict(line.split(":", 1) for line in Path("/proc/cpuinfo").read_text().splitlines() if ":" in line)
         info = {k.strip(): v.strip() for k, v in info.items()}
