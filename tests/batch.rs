@@ -113,3 +113,88 @@ fn reduced_pairs_preserve_primitive_error_order_and_workspace_reuse() {
     let seeds = [[0.5, -0.5], [-2.0, 3.0], [1.0, 1.0]];
     assert_eq!(batch.vjp(&row, &seeds).unwrap(), &[[-0.5, -5.5]; 8]);
 }
+
+#[test]
+fn extrema_keep_left_ties_and_scalar_zero_bits_per_lane() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let y = b.input();
+    let lo = b.min(x, y).unwrap();
+    let hi = b.max(x, y).unwrap();
+    let twice = b.max(x, x).unwrap();
+    let g = b.compile(&[lo, hi, twice]).unwrap();
+    let mut batch = g.batch2().unwrap();
+    let mut ws = g.workspace();
+    let seeds = [[1.5, -1.0], [-2., 3.], [0.25, 0.5]];
+    for (a, b) in [
+        ([0., -0.], [-0., 0.]),
+        ([3., 3.], [1., -2.]),
+        ([-3., 0.], [4., 4.]),
+    ] {
+        let inputs = [[a[0], b[0]], [a[1], b[1]]];
+        let values = batch.evaluate_rows(&a, &b).unwrap().to_vec();
+        assert_eq!(values, batch.evaluate(&inputs).unwrap());
+        let grad = batch.vjp_rows(&a, &b, &seeds).unwrap().to_vec();
+        assert_eq!(grad, batch.vjp(&inputs, &seeds).unwrap());
+        for (lane, row) in [a, b].iter().enumerate() {
+            for (v, pair) in g.evaluate(row, &mut ws).unwrap().iter().zip(&values) {
+                assert_eq!(v.to_bits(), pair[lane].to_bits());
+            }
+            let seed = seeds.map(|s| s[lane]);
+            for (v, pair) in g.vjp(row, &seed, &mut ws).unwrap().iter().zip(&grad) {
+                assert_eq!(v.to_bits(), pair[lane].to_bits());
+            }
+        }
+    }
+    assert_eq!(
+        batch.evaluate_rows(&[1.], &[1., 2.]),
+        Err(AadError::InputShape)
+    );
+    assert_eq!(batch.vjp_rows(&[], &[], &[]), Err(AadError::SeedShape));
+}
+
+#[test]
+fn ordered_pair_sums_preserve_cancellation_and_recover_from_fallback() {
+    let mut b = GraphBuilder::new();
+    let xs: Vec<_> = (0..8).map(|_| b.input()).collect();
+    let zero = b.constant(0.).unwrap();
+    let mut sum = zero;
+    for x in xs {
+        sum = b.add(sum, x).unwrap();
+    }
+    let scale = b.constant(0.125).unwrap();
+    let mean = b.mul(sum, scale).unwrap();
+    let out = b.max(mean, zero).unwrap();
+    let g = b.compile(&[out]).unwrap();
+    let mut pair = g.batch2().unwrap();
+    let mut ws = g.workspace();
+    let a = [1e16, 1., -1e16, 0.25, -0.5, 1., -0.25, 2.];
+    let other = [-1.; 8];
+    for seed in [[1., 2.], [1e200, 0.], [-0., -3.], [1., 2.]] {
+        let values = pair.evaluate_rows(&a, &other).unwrap()[0];
+        let grads = pair.vjp_rows(&a, &other, &[seed]).unwrap();
+        for (k, x) in [a, other].iter().enumerate() {
+            assert_eq!(
+                values[k].to_bits(),
+                g.evaluate(x, &mut ws).unwrap()[0].to_bits()
+            );
+            for (pair, scalar) in grads.iter().zip(g.vjp(x, &[seed[k]], &mut ws).unwrap()) {
+                assert_eq!(pair[k].to_bits(), scalar.to_bits());
+            }
+        }
+    }
+    assert_eq!(
+        pair.vjp_rows(&a, &other, &[[f64::MAX, 0.]]).unwrap_err(),
+        g.vjp(&a, &[f64::MAX], &mut ws).unwrap_err()
+    );
+    let mut bad = a;
+    bad[7] = f64::NAN;
+    assert_eq!(pair.evaluate_rows(&bad, &a), Err(AadError::NonFiniteInput));
+    let mut huge = [0.; 8];
+    huge[..2].fill(f64::MAX);
+    assert_eq!(
+        pair.evaluate_rows(&a, &huge).unwrap_err(),
+        g.evaluate(&huge, &mut ws).unwrap_err()
+    );
+    assert!(pair.vjp_rows(&a, &other, &[[1.; 2]]).is_ok());
+}

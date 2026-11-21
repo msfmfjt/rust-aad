@@ -10,6 +10,7 @@ enum Operator {
     Max,
 }
 
+#[derive(Clone)]
 struct Step {
     op: Operator,
     constant: f64,
@@ -66,6 +67,7 @@ impl AffineClamp {
         None
     }
 }
+#[derive(Clone)]
 pub(super) struct SumChain {
     affine: Option<AffineClamp>,
     initial: f64,
@@ -137,6 +139,11 @@ impl SumChain {
             scales,
             steps: steps.into_boxed_slice(),
         })
+    }
+
+    #[cfg(feature = "simd")]
+    pub(super) fn initial(&self) -> f64 {
+        self.initial
     }
 
     fn within_bound(&self, value: f64) -> bool {

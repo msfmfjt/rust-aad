@@ -538,3 +538,89 @@ cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --exa
 cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example prepared -- --sweeps 1000000 256
 cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example f64_sweeps -- 1000000 256
 ```
+
+## Three path VJP experiments
+
+One worker on an Apple M3 Max (macOS 27.0.1) ran Rust 1.98.1 release
+builds with the default target flags at `1a0f536`. The reference in each
+pair uses the existing scalar VJP in the same binary. Each time is the median
+of four process medians in milliseconds. Each process warmed up once and timed
+11 sweeps. We reversed trial and method order on alternating rounds. All
+inputs are ordinary path-major f64 values. Input generation, graph and
+workspace construction and correctness checks precede the clock.
+
+### Two paths per SIMD instruction
+
+Each sweep evaluates one million paths with 120 inputs and a unit output
+seed. The direct method reads two rows as it sums, preserving addition order
+within each lane. The interleaved method copies each pair into reusable
+scratch inside the timer, then invokes the packed-pair API. Forward outputs
+and every input adjoint in both lanes and both layouts matched scalar f64 bits
+for every row. The fixture has an exact binary grid. The full-precision
+control perturbs the low 16 significand bits and exercises the ordered f64
+fallback in the scalar evaluator.
+
+| Inputs | Scalar ms | Direct SIMD ms | Copy + SIMD ms | Scalar / direct |
+|---|---:|---:|---:|---:|
+| fixture | 21.31 | 37.20 | 52.68 | 0.57× |
+| full | 44.46 | 37.20 | 52.72 | 1.20× |
+
+Use direct row SIMD for the full-precision average on this host. The scalar
+exact-sum path wins on the grid fixture. The measurements include the cost
+of reading path-major input in all three cases.
+
+### Reusing a forward evaluation
+
+Each sweep uses 10,000 paths and two outputs. The first two seeds select
+individual outputs, followed by distinct weighted combinations. Timings
+include every forward and reverse sweep. Both methods consume each borrowed
+gradient. A separate check verifies forward values and every derivative for
+each path and seed against separate scalar calls. Only one path's primal
+values and active trace are live at a time.
+
+| Graph | Seed vectors | Repeated VJP ms | Shared forward ms | Repeated / shared |
+|---|---:|---:|---:|---:|
+| `affine32-v1` | 1 | 1.085 | 1.111 | 0.98× |
+| `affine32-v1` | 2 | 2.194 | 1.725 | 1.27× |
+| `affine32-v1` | 4 | 4.396 | 2.952 | 1.49× |
+| `affine32-v1` | 8 | 8.741 | 5.416 | 1.61× |
+| `width-100-v1` | 1 | 0.960 | 0.950 | 1.01× |
+| `width-100-v1` | 2 | 1.927 | 1.338 | 1.44× |
+| `width-100-v1` | 4 | 3.891 | 2.129 | 1.83× |
+| `width-100-v1` | 8 | 7.683 | 3.625 | 2.12× |
+
+### Adding gradients directly to totals
+
+Each sweep evaluates the same one million paths and produces one sum per
+input. Both methods use the same checked sequential f64 addition in original
+path order. The stored method writes every gradient to a preallocated matrix
+before reading it back to sum. The streamed method consumes the borrowed
+gradient immediately. Both reproduce the bit pattern from a separate pathwise
+sum of scalar VJPs. Timings include the additions, copies and clearing the
+totals. Destination allocation is outside the timer.
+
+| Inputs | Store then sum ms | Stream ms | Stored / streamed | Peak process RSS, stored / streamed (MB) |
+|---|---:|---:|---:|---:|
+| fixture | 69.12 | 51.57 | 1.34× | 1924 / 964 |
+| full | 126.57 | 112.08 | 1.13× | 1924 / 964 |
+
+The result buffers use 960,000,960 bytes for the matrix and totals or 960 bytes
+for just the totals. Both processes also hold the same 960 MB of inputs and
+a per-worker workspace. RSS includes the executable, reference checks and
+other live memory. All 26 timed configurations used zero warm allocations in
+separate instrumented runs. Output/gradient files in the existing 16-case
+10k-path matrix matched revision `5aec0ed` byte for byte.
+
+Run the example in the separate benchmark package. Switch the SIMD method
+among `scalar`, `rows` and `interleave`, the multi-seed method between
+`repeat` and `shared`, and the aggregate method between `store` and `stream`.
+Use either `fixture` or `full` for average inputs. For multiple seeds choose
+`affine32-v1` or `width-100-v1` with 1, 2, 4 or 8 directions.
+
+```sh
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example path_vjp -- simd rows average-120-v1 1000000 full 1
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example path_vjp -- multi shared width-100-v1 10000 fixture 8
+cargo +1.98.1 run --locked --release --manifest-path benchmarks/Cargo.toml --example path_vjp -- aggregate stream average-120-v1 1000000 fixture 1
+```
+
+[All samples, measured allocations, peak RSS and existing matrix result digests](../benchmarks/evidence/m3-max-2026-11-21/path-vjp.json.gz).

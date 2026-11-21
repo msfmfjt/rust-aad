@@ -7,6 +7,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+mod aggregate;
+pub use aggregate::{AccumulationError, accumulate_gradient};
 mod blocks;
 mod lazy;
 mod moments;
@@ -436,9 +438,7 @@ impl CompiledGraph {
         output_seeds: &[f64],
         w: &'a mut Workspace,
     ) -> Result<&'a [f64], AadError> {
-        if output_seeds.len() != self.outputs.len() || output_seeds.iter().any(|v| !v.is_finite()) {
-            return Err(AadError::SeedShape);
-        }
+        self.check_seeds(output_seeds)?;
         self.preflight(inputs, w)?;
         if let Some(schedule) = &self.straight_line {
             if let Some((value, gradient)) = schedule
@@ -452,6 +452,39 @@ impl CompiledGraph {
             }
         }
         self.evaluate_graph(inputs, w)?;
+        self.reverse_evaluated(inputs, output_seeds, w)
+    }
+
+    fn check_seeds(&self, seeds: &[f64]) -> Result<(), AadError> {
+        if seeds.len() == self.outputs.len() && seeds.iter().all(|v| v.is_finite()) {
+            Ok(())
+        } else {
+            Err(AadError::SeedShape)
+        }
+    }
+
+    /// Evaluate one input row and retain its primal values and active branch
+    /// trace for any number of subsequent reverse sweeps.
+    pub fn linearize<'a>(
+        &'a self,
+        inputs: &'a [f64],
+        work: &'a mut Workspace,
+    ) -> Result<Pullback<'a>, AadError> {
+        self.preflight(inputs, work)?;
+        self.evaluate_graph(inputs, work)?;
+        Ok(Pullback {
+            graph: self,
+            inputs,
+            work,
+        })
+    }
+
+    fn reverse_evaluated<'a>(
+        &self,
+        inputs: &[f64],
+        output_seeds: &[f64],
+        w: &'a mut Workspace,
+    ) -> Result<&'a [f64], AadError> {
         w.uniform_gradient = None;
         let ranges = self
             .straight_line
@@ -549,6 +582,26 @@ impl CompiledGraph {
         Ok(())
     }
 }
+/// A forward evaluation for one immutable input row. Each reverse sweep
+/// starts with fresh adjoints and reuses the same workspace and primal values.
+pub struct Pullback<'a> {
+    graph: &'a CompiledGraph,
+    inputs: &'a [f64],
+    work: &'a mut Workspace,
+}
+
+impl Pullback<'_> {
+    pub fn outputs(&self) -> &[f64] {
+        &self.work.output
+    }
+
+    /// Return J(inputs)^T times this seed vector. A failed seed can be retried.
+    pub fn vjp(&mut self, seeds: &[f64]) -> Result<&[f64], AadError> {
+        self.graph.check_seeds(seeds)?;
+        self.graph.reverse_evaluated(self.inputs, seeds, self.work)
+    }
+}
+
 fn reset_adjoints<T: Copy>(adjoints: &mut [T], ranges: &[std::ops::Range<usize>], zero: T) {
     if ranges.is_empty() {
         adjoints.fill(zero);
