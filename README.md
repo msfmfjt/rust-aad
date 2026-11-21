@@ -81,6 +81,16 @@ error. Correct rounding, cross-platform bitwise identity, and release quality
 are **not** claimed; run Rust CI before use.
 
 
+## Replaying stored input paths
+
+`PreparedInputs::new(paths, width, values)` takes a path-major `Vec<f64>`.
+It stores inputs on a common binary grid in two bytes per value when every bit
+can be recovered. Other matrices keep their original `f64` representation.
+Call `inputs.replay(&graph)?` once per worker, then use `evaluate(path)?` or
+`vjp(path, &seeds)?`. After a successful VJP, `outputs()` also returns the
+primal values for that path. Conversion is a one-time cost for repeated replay.
+See the [measurements](docs/benchmarks.md#losslessly-prepared-input-paths-on-apple-m3-max).
+
 ## Experimental two-path SIMD
 
 Enable `--features simd` and call `CompiledGraph::batch2()` once per worker.

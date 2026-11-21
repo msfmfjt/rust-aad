@@ -11,6 +11,8 @@ mod blocks;
 mod lazy;
 mod moments;
 mod ordered_sum;
+mod prepared;
+pub use prepared::{InputReplay, PreparedInputs};
 mod recurrence;
 mod sum_chain;
 use blocks::Block;
@@ -334,6 +336,15 @@ impl CompiledGraph {
             active: Vec::with_capacity(dynamic_nodes),
             static_executed: 0,
             uniform_gradient: Some(0.0),
+            zero_gradient: if self
+                .straight_line
+                .as_ref()
+                .is_some_and(|s| s.sum_chain.is_some())
+            {
+                vec![0.0; self.input_count].into_boxed_slice()
+            } else {
+                Box::default()
+            },
             graph_id: self.graph_id,
         }
     }
@@ -437,11 +448,7 @@ impl CompiledGraph {
             {
                 w.static_executed = schedule.order.len();
                 w.output[0] = value;
-                if w.uniform_gradient != Some(gradient) {
-                    w.input_adjoints.fill(gradient);
-                    w.uniform_gradient = Some(gradient);
-                }
-                return Ok(&w.input_adjoints);
+                return Ok(w.uniform_adjoints(gradient));
             }
         }
         self.evaluate_graph(inputs, w)?;
@@ -563,6 +570,7 @@ pub struct Workspace {
     active: Vec<u16>,
     static_executed: usize,
     uniform_gradient: Option<f64>,
+    zero_gradient: Box<[f64]>,
     graph_id: u64,
 }
 
@@ -580,6 +588,17 @@ pub struct WorkspaceCapacities {
 }
 
 impl Workspace {
+    fn uniform_adjoints(&mut self, gradient: f64) -> &[f64] {
+        if gradient == 0.0 {
+            return &self.zero_gradient;
+        }
+        if self.uniform_gradient != Some(gradient) {
+            self.input_adjoints.fill(gradient);
+            self.uniform_gradient = Some(gradient);
+        }
+        &self.input_adjoints
+    }
+
     #[must_use]
     pub fn capacities(&self) -> WorkspaceCapacities {
         WorkspaceCapacities {
