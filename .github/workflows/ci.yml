@@ -1,8 +1,12 @@
 name: Rust CI
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -12,24 +16,51 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Build all targets
+        run: cargo build --locked --workspace --all-targets --all-features
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --locked --workspace --all-targets --all-features
+      - name: Doc tests
+        run: cargo test --locked --workspace --doc --all-features
       - name: Documentation
-        run: cargo doc --no-deps
+        run: cargo doc --locked --all-features --no-deps
+
+      - name: Check fixed scalar and SIMD workload
+        shell: bash
+        run: |
+          cargo run --locked --release --features simd --example fixed_batch > affine32.jsonl
+          cat affine32.jsonl
+          {
+            git rev-parse HEAD
+            rustc -Vv
+            cargo -V
+            echo "profile=release threads=1 runner=${RUNNER_OS}/${RUNNER_ARCH} RUSTFLAGS=${RUSTFLAGS:-}"
+            case "$RUNNER_OS" in
+              Linux) lscpu ;;
+              macOS) sysctl -n machdep.cpu.brand_string ;;
+              Windows) powershell -NoProfile -Command '(Get-CimInstance Win32_Processor).Name' ;;
+            esac
+          } > environment.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: affine32-${{ matrix.os }}
+          path: |
+            affine32.jsonl
+            environment.txt
 
   baseline:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Run illustrative interpreter baseline
         shell: bash
@@ -38,7 +69,7 @@ jobs:
           rustc --version > environment.txt
           cargo --version >> environment.txt
           uname -a >> environment.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: aad-baseline-linux
           path: |

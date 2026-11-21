@@ -20,9 +20,9 @@ The bootstrap graph is a deliberately smaller independent prototype; it is **not
 - `CompiledGraph` is immutable and should be shareable between threads.
 - `Workspace` owns mutable scratch storage; one per worker.
 - `evaluate` reuses primal workspace; `vjp` accepts arbitrary output seeds and returns input adjoints.
-- Iterative evaluation now uses a per-workspace explicit task stack; inactive conditional branches are not evaluated, and the reverse sweep follows visited nodes.
+- Conditional evaluation follows compiled jumps and records the visited nodes for the reverse sweep.
 - Workspaces carry a compiled-graph identity, not just shape, and cannot be used with another graph.
-- Still pending: compact register allocation, generalized custom VJP, checkpoint/recompute policies, batched SIMD, optional isolated JIT backend.
+- Still pending: compact register allocation, generalized custom VJP, checkpoint/recompute policies, broader SIMD opcode coverage, optional isolated JIT backend.
 
 ## Integration
 
@@ -34,10 +34,70 @@ Keep `#![forbid(unsafe_code)]` in the core. Do not promise bitwise identity acro
 
 ## Iterative evaluator constraints (experimental)
 
-The interpreter schedules each node using a two-stage explicit stack (plus a conditional-dispatch stage). It evaluates dependencies before their consumer and evaluates only the chosen branch for `Select`. The scratch stack is owned by the per-worker workspace, and it is cleared at the start of each forward or VJP call. This avoids native call-stack exhaustion for long sequential DAGs; it does not prove optimal CPU cache behavior or full memory-allocator elimination.
+The compiler visits dependencies in left-first order. Conditional graphs use
+jumps to enter the chosen arm of a select. Shared interior expressions have
+one compiled body. The workspace memoizes each completed body for the path
+and reserves return addresses during preparation. The evaluator records a
+node after its value passes the finiteness check, preserving the first failing
+node and the completed prefix. The compiler and evaluator both handle deep
+graphs iteratively.
 
-Tests include a 50,000-step dependency chain, an invalid inactive branch with 20,000 nested nodes, graph identity checks, and repeated VJP calls. **Rust toolchain execution is still required** before claiming these tests pass.
+Tests include a 50,000-step dependency chain, an invalid inactive branch with 20,000 nested nodes, graph identity checks, and repeated VJP calls.
 
 ## Active execution trace for reverse (P1 iteration)
 
-During iterative evaluation, each newly computed node is appended to a workspace-owned `active` vector after its prerequisites. Reversing this order is a valid reverse topological sweep for all actually visited nodes, even when outputs share intermediate dependencies. VJP therefore no longer scans nodes excluded by lazy conditional execution. Both active-node and adjoint buffers are reused. The scratch array capacities can be inspected for regression testing, but this is not an allocator-level proof. Benchmark scalar execution separately from branch-heavy cases; active-vector writes may cost performance on fully active graphs. No Rust CI results are available yet.
+Branch-free graphs store a single forward order on the compiled graph. The SIMD arithmetic executor uses it when preparing its tape. Lazy evaluation records the active order in the workspace for each path. Reversing either order visits every consumer before its dependencies. A node's adjoint is therefore final when it is visited, and the reverse interpreter checks it for finiteness at that point. This also covers repeated output seeds. The primal and adjoint arrays and the input-gradient buffer are reused across calls.
+
+The scalar compiler groups consecutive steps when they form an ordered sum
+of contiguous input slots or an ordered dot product over contiguous primal
+slots. Each group needs at least four terms. A graph output or another use of
+an intermediate ends the group at that intermediate. Shared inputs retain
+their primal values for other consumers. The dot product supports overlapping
+operand ranges, including sums of squares.
+
+The loops preserve the primitive multiply, add and adjoint accumulation order.
+They check the final sum for finiteness. Once an addition produces infinity or
+NaN, further additions cannot produce a finite value. A failed check replays
+the original schedule to locate the first failure and count the completed nodes.
+Reverse checks shared input adjoints in their original visit order.
+
+Static schedules record whether they visit every declared input. Each input
+then passes a finiteness check when it is read individually or as part of an
+ordered sum. A failed evaluation checks the inputs before reporting the
+original failing operation. Graphs with unreachable inputs or lazy branches
+continue to validate all inputs up front.
+
+For a single ordered sum followed by a single-output chain of add, subtract,
+multiply, minimum or maximum with right-hand constants, the scalar compiler
+records the constants and the multipliers in reverse order. A clamp selecting
+its constant cuts the derivative to the sum. Ties select the left operand.
+Every input has the same derivative, so a workspace can retain the last
+uniform gradient vector across calls. Each call reads its inputs and seed.
+
+The compiler bounds reverse growth by a power of two per multiplier and
+reserves enough exponent bits to add all contributions to a shared constant.
+The fast path checks the seed and each successive primal against the resulting
+limit. Outside that interval the primitive reverse rules also check adjoints
+at constant nodes and report the original error, if any.
+
+The two-lane arithmetic tape maps the ordered sum and dot-product blocks to
+its compact slots during preparation. It preserves multiplication and addition
+order independently in each lane, including for overlapping dot operands.
+
+
+A scalar sum starting at zero can use integer addition for 16 through 2,048
+terms when a runtime check proves every ordered prefix is exactly
+representable up to overflow. The terms must be normal numbers of the same
+sign and binary exponent, with at least ceil(log2(count)) trailing zero bits
+in every significand. Their integer total then fits in 64 bits and converts
+exactly back to binary64 at the common scale. Other inputs take the ordinary
+ordered floating-point path.
+
+Adjacent reductions for a sum and a sum of squares can share one input pass
+when their leaves have exactly those three operand uses. A repeated multiply
+and add with fixed scale and bias can keep the state in a register and retain
+the intermediate states needed for the scale derivative. Scalar and two-lane
+backends use the same kernels. When many adjoint slots belong to private
+intermediates, the compiler groups the surviving slots into ranges to clear
+on each VJP. The primitive schedule still locates the original failure on a
+nonfinite forward result.

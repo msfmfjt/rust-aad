@@ -18,3 +18,20 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = "warn"
+
+[dev-dependencies]
+stats_alloc = "0.1.10"
+
+[[test]]
+name = "allocations"
+harness = false
+
+[dependencies]
+wide = { version = "0.7.33", default-features = false, optional = true }
+
+[features]
+simd = ["dep:wide"]
+
+[[example]]
+name = "fixed_batch"
+required-features = ["simd"]

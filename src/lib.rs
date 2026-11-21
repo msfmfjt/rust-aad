@@ -1,9 +1,27 @@
 //! Experimental f64 graph with lazy branches and reusable primal/adjoint storage.
 //! Not yet a performance replacement for AADC/XAD.
 #![forbid(unsafe_code)]
-use std::{error::Error, fmt, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    error::Error,
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-const MAX_NODES: usize = 65_536;
+mod blocks;
+mod lazy;
+mod moments;
+mod ordered_sum;
+mod recurrence;
+mod sum_chain;
+use blocks::Block;
+use sum_chain::SumChain;
+
+#[cfg(feature = "simd")]
+mod batch;
+#[cfg(feature = "simd")]
+pub use batch::Batch2;
+
+const MAX_NODES: usize = u16::MAX as usize + 1;
 static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Graph-local handle; cannot be constructed outside the library.
@@ -12,194 +30,541 @@ pub struct NodeId(usize, u64);
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
-    Input(usize), Constant(f64), Add(NodeId, NodeId), Sub(NodeId, NodeId),
-    Mul(NodeId, NodeId), Div(NodeId, NodeId), Neg(NodeId), Exp(NodeId),
-    Ln(NodeId), Greater(NodeId, NodeId), Min(NodeId, NodeId), Max(NodeId, NodeId),
-    Select { condition: NodeId, positive: NodeId, zero: NodeId },
+    Input(usize),
+    Constant(f64),
+    Add(usize, usize),
+    Sub(usize, usize),
+    Mul(usize, usize),
+    Div(usize, usize),
+    Neg(usize),
+    Exp(usize),
+    Ln(usize),
+    Greater(usize, usize),
+    Min(usize, usize),
+    Max(usize, usize),
+    Select {
+        condition: usize,
+        positive: usize,
+        zero: usize,
+    },
+}
+
+impl Op {
+    fn operands(self) -> impl DoubleEndedIterator<Item = usize> {
+        let children = match self {
+            Self::Input(_) | Self::Constant(_) => [None; 3],
+            Self::Neg(a) | Self::Exp(a) | Self::Ln(a) => [Some(a), None, None],
+            Self::Add(a, b)
+            | Self::Sub(a, b)
+            | Self::Mul(a, b)
+            | Self::Div(a, b)
+            | Self::Greater(a, b)
+            | Self::Min(a, b)
+            | Self::Max(a, b) => [Some(a), Some(b), None],
+            Self::Select {
+                condition,
+                positive,
+                zero,
+            } => [Some(condition), Some(positive), Some(zero)],
+        };
+        children.into_iter().flatten()
+    }
+
+    #[inline]
+    fn value(self, inputs: &[f64], p: &[f64]) -> f64 {
+        match self {
+            Op::Input(k) => inputs[k],
+            Op::Constant(v) => v,
+            Op::Neg(a) => -p[a],
+            Op::Exp(a) => p[a].exp(),
+            Op::Ln(a) => p[a].ln(),
+            Op::Select {
+                condition,
+                positive,
+                zero,
+            } => p[if p[condition] != 0.0 { positive } else { zero }],
+            Op::Add(a, b) => p[a] + p[b],
+            Op::Sub(a, b) => p[a] - p[b],
+            Op::Mul(a, b) => p[a] * p[b],
+            Op::Div(a, b) => p[a] / p[b],
+            Op::Greater(a, b) => {
+                if p[a] > p[b] {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Op::Min(a, b) => p[a].min(p[b]),
+            Op::Max(a, b) => p[a].max(p[b]),
+        }
+    }
+}
+
+// The left-first postorder is observable through reverse accumulation and
+// the first nonfinite result. Only reachable nodes belong to the schedule.
+fn straight_line_order(nodes: &[Op], outputs: &[NodeId]) -> Option<Box<[u16]>> {
+    let mut visited = vec![false; nodes.len()];
+    let mut order = Vec::new();
+    let mut stack = Vec::new();
+    for root in outputs {
+        stack.push((root.0, false));
+        while let Some((i, finish)) = stack.pop() {
+            if visited[i] {
+                continue;
+            }
+            if !finish {
+                stack.push((i, true));
+                if matches!(nodes[i], Op::Select { .. }) {
+                    return None;
+                }
+                stack.extend(nodes[i].operands().rev().map(|child| (child, false)));
+            } else {
+                visited[i] = true;
+                order.push(i as u16);
+            }
+        }
+    }
+    Some(order.into_boxed_slice())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AadError {
-    InvalidNode, EmptyOutputs, GraphTooLarge, InputShape, SeedShape,
-    InvalidConstant, NonFiniteInput, NonFiniteResult { node: usize },
+    InvalidNode,
+    EmptyOutputs,
+    GraphTooLarge,
+    InputShape,
+    SeedShape,
+    InvalidConstant,
+    NonFiniteInput,
+    NonFiniteResult { node: usize },
     InvalidWorkspace,
 }
 impl fmt::Display for AadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "AAD error: {self:?}") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AAD error: {self:?}")
+    }
 }
 impl Error for AadError {}
 
 /// Construct an immutable graph. Nodes are topologically ordered by construction.
-pub struct GraphBuilder { nodes: Vec<Op>, input_count: usize, graph_id: u64 }
+pub struct GraphBuilder {
+    nodes: Vec<Op>,
+    input_count: usize,
+    graph_id: u64,
+}
 impl Default for GraphBuilder {
     fn default() -> Self {
-        Self { nodes: Vec::new(), input_count: 0, graph_id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed) }
+        Self {
+            nodes: Vec::new(),
+            input_count: 0,
+            graph_id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
+        }
     }
 }
 impl GraphBuilder {
-    pub fn new() -> Self { Self::default() }
-    fn push(&mut self, op: Op) -> NodeId { let id = NodeId(self.nodes.len(), self.graph_id); self.nodes.push(op); id }
-    pub fn input(&mut self) -> NodeId { let i = self.input_count; self.input_count += 1; self.push(Op::Input(i)) }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn push(&mut self, op: Op) -> NodeId {
+        let id = NodeId(self.nodes.len(), self.graph_id);
+        self.nodes.push(op);
+        id
+    }
+    pub fn input(&mut self) -> NodeId {
+        let i = self.input_count;
+        self.input_count += 1;
+        self.push(Op::Input(i))
+    }
     pub fn constant(&mut self, v: f64) -> Result<NodeId, AadError> {
-        if !v.is_finite() { return Err(AadError::InvalidConstant); }
+        if !v.is_finite() {
+            return Err(AadError::InvalidConstant);
+        }
         Ok(self.push(Op::Constant(v)))
     }
-    fn unary(&mut self, a: NodeId, f: impl FnOnce(NodeId) -> Op) -> Result<NodeId, AadError> {
-        self.check(a)?; Ok(self.push(f(a)))
+    fn unary(&mut self, a: NodeId, f: impl FnOnce(usize) -> Op) -> Result<NodeId, AadError> {
+        self.check(a)?;
+        Ok(self.push(f(a.0)))
     }
-    fn binary(&mut self, a: NodeId, b: NodeId, f: impl FnOnce(NodeId, NodeId) -> Op) -> Result<NodeId, AadError> {
-        self.check(a)?; self.check(b)?; Ok(self.push(f(a,b)))
+    fn binary(
+        &mut self,
+        a: NodeId,
+        b: NodeId,
+        f: impl FnOnce(usize, usize) -> Op,
+    ) -> Result<NodeId, AadError> {
+        self.check(a)?;
+        self.check(b)?;
+        Ok(self.push(f(a.0, b.0)))
     }
     fn check(&self, node: NodeId) -> Result<(), AadError> {
-        if node.1 != self.graph_id || node.0 >= self.nodes.len() { Err(AadError::InvalidNode) } else { Ok(()) }
+        if node.1 != self.graph_id || node.0 >= self.nodes.len() {
+            Err(AadError::InvalidNode)
+        } else {
+            Ok(())
+        }
     }
-    pub fn add(&mut self, a: NodeId,b: NodeId)->Result<NodeId,AadError>{self.binary(a,b,Op::Add)}
-    pub fn sub(&mut self, a: NodeId,b: NodeId)->Result<NodeId,AadError>{self.binary(a,b,Op::Sub)}
-    pub fn mul(&mut self, a: NodeId,b: NodeId)->Result<NodeId,AadError>{self.binary(a,b,Op::Mul)}
-    pub fn div(&mut self, a: NodeId,b: NodeId)->Result<NodeId,AadError>{self.binary(a,b,Op::Div)}
-    pub fn min(&mut self, a: NodeId,b: NodeId)->Result<NodeId,AadError>{self.binary(a,b,Op::Min)}
-    pub fn max(&mut self, a: NodeId,b: NodeId)->Result<NodeId,AadError>{self.binary(a,b,Op::Max)}
-    pub fn greater(&mut self,a:NodeId,b:NodeId)->Result<NodeId,AadError>{self.binary(a,b,Op::Greater)}
-    pub fn neg(&mut self,a:NodeId)->Result<NodeId,AadError>{self.unary(a,Op::Neg)}
-    pub fn exp(&mut self,a:NodeId)->Result<NodeId,AadError>{self.unary(a,Op::Exp)}
-    pub fn ln(&mut self,a:NodeId)->Result<NodeId,AadError>{self.unary(a,Op::Ln)}
+    pub fn add(&mut self, a: NodeId, b: NodeId) -> Result<NodeId, AadError> {
+        self.binary(a, b, Op::Add)
+    }
+    pub fn sub(&mut self, a: NodeId, b: NodeId) -> Result<NodeId, AadError> {
+        self.binary(a, b, Op::Sub)
+    }
+    pub fn mul(&mut self, a: NodeId, b: NodeId) -> Result<NodeId, AadError> {
+        self.binary(a, b, Op::Mul)
+    }
+    pub fn div(&mut self, a: NodeId, b: NodeId) -> Result<NodeId, AadError> {
+        self.binary(a, b, Op::Div)
+    }
+    pub fn min(&mut self, a: NodeId, b: NodeId) -> Result<NodeId, AadError> {
+        self.binary(a, b, Op::Min)
+    }
+    pub fn max(&mut self, a: NodeId, b: NodeId) -> Result<NodeId, AadError> {
+        self.binary(a, b, Op::Max)
+    }
+    pub fn greater(&mut self, a: NodeId, b: NodeId) -> Result<NodeId, AadError> {
+        self.binary(a, b, Op::Greater)
+    }
+    pub fn neg(&mut self, a: NodeId) -> Result<NodeId, AadError> {
+        self.unary(a, Op::Neg)
+    }
+    pub fn exp(&mut self, a: NodeId) -> Result<NodeId, AadError> {
+        self.unary(a, Op::Exp)
+    }
+    pub fn ln(&mut self, a: NodeId) -> Result<NodeId, AadError> {
+        self.unary(a, Op::Ln)
+    }
     /// Lazy select; does not evaluate the inactive branch. A nonzero condition selects `positive`.
-    pub fn select(&mut self, condition:NodeId,positive:NodeId,zero:NodeId)->Result<NodeId,AadError>{
-        self.check(condition)?; self.check(positive)?; self.check(zero)?;
-        Ok(self.push(Op::Select{condition,positive,zero}))
+    pub fn select(
+        &mut self,
+        condition: NodeId,
+        positive: NodeId,
+        zero: NodeId,
+    ) -> Result<NodeId, AadError> {
+        self.check(condition)?;
+        self.check(positive)?;
+        self.check(zero)?;
+        Ok(self.push(Op::Select {
+            condition: condition.0,
+            positive: positive.0,
+            zero: zero.0,
+        }))
     }
-    pub fn compile(self, outputs: &[NodeId]) -> Result<CompiledGraph,AadError> {
-        if outputs.is_empty() { return Err(AadError::EmptyOutputs); }
-        if self.nodes.len() > MAX_NODES { return Err(AadError::GraphTooLarge); }
-        for &o in outputs { self.check(o)?; }
-        Ok(CompiledGraph { nodes: self.nodes.into_boxed_slice(), outputs: outputs.into(), input_count:self.input_count, graph_id:self.graph_id })
+    pub fn compile(self, outputs: &[NodeId]) -> Result<CompiledGraph, AadError> {
+        if outputs.is_empty() {
+            return Err(AadError::EmptyOutputs);
+        }
+        if self.nodes.len() > MAX_NODES {
+            return Err(AadError::GraphTooLarge);
+        }
+        for &o in outputs {
+            self.check(o)?;
+        }
+        let straight_line = straight_line_order(&self.nodes, outputs).map(|order| {
+            let blocks = Block::compile(&self.nodes, outputs, &order);
+            let covers_all_inputs = order
+                .iter()
+                .filter(|&&i| matches!(self.nodes[usize::from(i)], Op::Input(_)))
+                .count()
+                == self.input_count;
+            let sum_chain = SumChain::compile(&self.nodes, outputs, &blocks, self.input_count);
+            let reset_ranges = Block::reset_ranges(&blocks, &order, self.nodes.len(), |slot| slot);
+            StaticSchedule {
+                reset_ranges,
+                sum_chain,
+                order,
+                blocks,
+                covers_all_inputs,
+            }
+        });
+        let lazy = if straight_line.is_none() {
+            lazy::Program::compile(&self.nodes, outputs)
+        } else {
+            lazy::Program::default()
+        };
+        Ok(CompiledGraph {
+            lazy,
+            straight_line,
+            nodes: self.nodes.into_boxed_slice(),
+            outputs: outputs.into(),
+            input_count: self.input_count,
+            graph_id: self.graph_id,
+        })
     }
 }
 
+struct StaticSchedule {
+    reset_ranges: Box<[std::ops::Range<usize>]>,
+    sum_chain: Option<SumChain>,
+    covers_all_inputs: bool,
+    order: Box<[u16]>,
+    blocks: Box<[Block]>,
+}
+
 /// Immutable graph, shareable across workers. Each worker needs its own Workspace.
-pub struct CompiledGraph { nodes: Box<[Op]>, outputs: Box<[NodeId]>, input_count: usize, graph_id: u64 }
+pub struct CompiledGraph {
+    lazy: lazy::Program,
+    straight_line: Option<StaticSchedule>,
+    nodes: Box<[Op]>,
+    outputs: Box<[NodeId]>,
+    input_count: usize,
+    graph_id: u64,
+}
 impl CompiledGraph {
-    pub fn input_count(&self)->usize{self.input_count}
-    pub fn output_count(&self)->usize{self.outputs.len()}
-    pub fn node_count(&self)->usize{self.nodes.len()}
-    pub fn workspace(&self)->Workspace{Workspace {
-        primal:vec![0.0;self.nodes.len()], adjoint:vec![0.0;self.nodes.len()],
-        visited:vec![false;self.nodes.len()], output:vec![0.0;self.outputs.len()],
-        input_adjoints:vec![0.0;self.input_count], stack:Vec::with_capacity(self.nodes.len().saturating_mul(3)), active:Vec::with_capacity(self.nodes.len()), graph_id:self.graph_id,
-    }}
-    fn preflight(&self,inputs:&[f64],w:&Workspace)->Result<(),AadError>{
-        if inputs.len()!=self.input_count{return Err(AadError::InputShape)}
-        if inputs.iter().any(|v|!v.is_finite()){return Err(AadError::NonFiniteInput)}
-        if w.graph_id!=self.graph_id || w.primal.len()!=self.nodes.len()||w.adjoint.len()!=self.nodes.len()||w.visited.len()!=self.nodes.len()||w.active.capacity()<self.nodes.len()||w.output.len()!=self.outputs.len()||w.input_adjoints.len()!=self.input_count {
-            return Err(AadError::InvalidWorkspace)
+    pub fn input_count(&self) -> usize {
+        self.input_count
+    }
+    pub fn output_count(&self) -> usize {
+        self.outputs.len()
+    }
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+    pub fn workspace(&self) -> Workspace {
+        let dynamic_nodes = if self.straight_line.is_some() {
+            0
+        } else {
+            self.nodes.len()
+        };
+        Workspace {
+            primal: vec![0.0; self.nodes.len()],
+            adjoint: vec![0.0; self.nodes.len()],
+            visited: vec![false; dynamic_nodes],
+            output: vec![0.0; self.outputs.len()],
+            input_adjoints: vec![0.0; self.input_count],
+            stack: Vec::with_capacity(self.lazy.call_capacity),
+            active: Vec::with_capacity(dynamic_nodes),
+            static_executed: 0,
+            uniform_gradient: Some(0.0),
+            graph_id: self.graph_id,
+        }
+    }
+    fn preflight(&self, inputs: &[f64], w: &Workspace) -> Result<(), AadError> {
+        if inputs.len() != self.input_count {
+            return Err(AadError::InputShape);
+        }
+        // A completed static schedule checks each reachable input. On error we
+        // still check all inputs before reporting a workspace or node error.
+        if (w.graph_id != self.graph_id
+            || !self
+                .straight_line
+                .as_ref()
+                .is_some_and(|s| s.covers_all_inputs))
+            && inputs.iter().any(|v| !v.is_finite())
+        {
+            return Err(AadError::NonFiniteInput);
+        }
+        // Workspace fields are private and can only be created by this graph.
+        if w.graph_id != self.graph_id {
+            return Err(AadError::InvalidWorkspace);
         }
         Ok(())
     }
-    // An explicit evaluation stack avoids recursion depth proportional to graph depth.
-    // Phase 0 = schedule prerequisites, 1 = evaluate, 2 = resolve a lazy select.
-    fn eval(&self, id:NodeId,inputs:&[f64],w:&mut Workspace)->Result<f64,AadError>{
-        w.stack.push((id, 0));
-        while let Some((id, phase)) = w.stack.pop() {
-            let i = id.0;
-            if w.visited[i] { continue; }
-            let op = self.nodes[i];
-            if phase == 0 {
-                match op {
-                    Op::Input(_) | Op::Constant(_) => w.stack.push((id, 1)),
-                    Op::Select {condition, ..} => {
-                        w.stack.push((id, 2));
-                        if !w.visited[condition.0] { w.stack.push((condition, 0)); }
-                    }
-                    Op::Neg(a) | Op::Exp(a) | Op::Ln(a) => {
-                        w.stack.push((id, 1));
-                        if !w.visited[a.0] { w.stack.push((a, 0)); }
-                    }
-                    Op::Add(a,b) | Op::Sub(a,b) | Op::Mul(a,b) |
-                    Op::Div(a,b) | Op::Greater(a,b) | Op::Min(a,b) | Op::Max(a,b) => {
-                        w.stack.push((id, 1));
-                        if !w.visited[b.0] { w.stack.push((b, 0)); }
-                        if !w.visited[a.0] { w.stack.push((a, 0)); }
-                    }
-                }
-                continue;
+    fn evaluate_slots(
+        &self,
+        order: &[u16],
+        inputs: &[f64],
+        w: &mut Workspace,
+    ) -> Result<(), usize> {
+        for (completed, &slot) in order.iter().enumerate() {
+            let i = usize::from(slot);
+            let value = self.nodes[i].value(inputs, &w.primal);
+            if !value.is_finite() {
+                return Err(completed);
             }
-            if phase == 2 {
-                if let Op::Select {condition,positive,zero} = op {
-                    let selected = if w.primal[condition.0]!=0.0 { positive } else { zero };
-                    w.stack.push((id, 1));
-                    if !w.visited[selected.0] { w.stack.push((selected, 0)); }
-                }
-                continue;
-            }
-            let p=&w.primal;
-            let value=match op {
-                Op::Input(k)=>inputs[k], Op::Constant(v)=>v,
-                Op::Neg(a)=>-p[a.0], Op::Exp(a)=>p[a.0].exp(), Op::Ln(a)=>p[a.0].ln(),
-                Op::Select {condition,positive,zero}=> {
-                    p[if p[condition.0]!=0.0 {positive.0}else{zero.0}]
-                }
-                Op::Add(a,b)=>p[a.0]+p[b.0],
-                Op::Sub(a,b)=>p[a.0]-p[b.0],
-                Op::Mul(a,b)=>p[a.0]*p[b.0],
-                Op::Div(a,b)=>p[a.0]/p[b.0],
-                Op::Greater(a,b)=>if p[a.0]>p[b.0]{1.0}else{0.0},
-                Op::Min(a,b)=>p[a.0].min(p[b.0]),
-                Op::Max(a,b)=>p[a.0].max(p[b.0]),
-            };
-            if !value.is_finite(){w.stack.clear();return Err(AadError::NonFiniteResult{node:i})}
-            w.primal[i]=value;
-            w.visited[i]=true;
-            // Forward executes dependencies before consumers. This execution-order
-            // trace is reverse-topological, even for lazy branches and shared DAGs.
-            w.active.push(i);
+            w.primal[i] = value;
         }
-        Ok(w.primal[id.0])
+        Ok(())
     }
     /// Evaluate all outputs. The workspace owns returned values; each call overwrites them.
-    pub fn evaluate<'a>(&self,inputs:&[f64],w:&'a mut Workspace)->Result<&'a [f64],AadError>{
-        self.preflight(inputs,w)?;w.visited.fill(false);w.stack.clear();w.active.clear();
-        for (k,&id) in self.outputs.iter().enumerate(){w.output[k]=self.eval(id,inputs,w)?;}
+    pub fn evaluate<'a>(
+        &self,
+        inputs: &[f64],
+        w: &'a mut Workspace,
+    ) -> Result<&'a [f64], AadError> {
+        self.preflight(inputs, w)?;
+        if let Some(schedule) = &self.straight_line {
+            if let Some((value, _)) = schedule
+                .sum_chain
+                .as_ref()
+                .and_then(|chain| chain.evaluate(inputs))
+            {
+                w.output[0] = value;
+                w.static_executed = schedule.order.len();
+                return Ok(&w.output);
+            }
+        }
+        self.evaluate_graph(inputs, w)?;
         Ok(&w.output)
     }
-    /// Vector-Jacobian product: J(inputs)^T * output_seeds. Multiple outputs supported.
-    pub fn vjp<'a>(&self,inputs:&[f64],output_seeds:&[f64],w:&'a mut Workspace)->Result<&'a [f64],AadError>{
-        if output_seeds.len()!=self.outputs.len() || output_seeds.iter().any(|v|!v.is_finite()){
-            return Err(AadError::SeedShape);
-        }
-        self.evaluate(inputs,w)?;
-        w.adjoint.fill(0.0);w.input_adjoints.fill(0.0);
-        for (&o,&seed) in self.outputs.iter().zip(output_seeds){w.adjoint[o.0]+=seed;}
-        // Only reverse nodes executed on this invocation. A large inactive
-        // branch has no sweep cost; active storage is reused across calls.
-        for &i in w.active.iter().rev(){
-            let seed=w.adjoint[i];if seed==0.0{continue}
-            let p=&w.primal;
-            match self.nodes[i]{
-                Op::Input(k)=>w.input_adjoints[k]+=seed,Op::Constant(_)|Op::Greater(..)=>{},
-                Op::Add(a,b)=>{w.adjoint[a.0]+=seed;w.adjoint[b.0]+=seed;},
-                Op::Sub(a,b)=>{w.adjoint[a.0]+=seed;w.adjoint[b.0]-=seed;},
-                Op::Mul(a,b)=>{w.adjoint[a.0]+=seed*p[b.0];w.adjoint[b.0]+=seed*p[a.0];},
-                Op::Div(a,b)=>{w.adjoint[a.0]+=seed/p[b.0];w.adjoint[b.0]+=division_denominator_adjoint(seed,p[a.0],p[b.0]);},
-                Op::Neg(a)=>w.adjoint[a.0]-=seed,
-                Op::Exp(a)=>w.adjoint[a.0]+=seed*p[i],
-                Op::Ln(a)=>w.adjoint[a.0]+=seed/p[a.0],
-                Op::Min(a,b)=>{if p[a.0]<=p[b.0]{w.adjoint[a.0]+=seed}else{w.adjoint[b.0]+=seed}},
-                Op::Max(a,b)=>{if p[a.0]>=p[b.0]{w.adjoint[a.0]+=seed}else{w.adjoint[b.0]+=seed}},
-                Op::Select{condition,positive,zero}=>{
-                    let selected=if p[condition.0]!=0.0{positive}else{zero};w.adjoint[selected.0]+=seed;
+
+    fn evaluate_graph(&self, inputs: &[f64], w: &mut Workspace) -> Result<(), AadError> {
+        if let Some(schedule) = &self.straight_line {
+            if schedule.blocks.is_empty() || !self.evaluate_blocks(schedule, inputs, w) {
+                if let Err(completed) = self.evaluate_slots(&schedule.order, inputs, w) {
+                    if schedule.covers_all_inputs && inputs.iter().any(|v| !v.is_finite()) {
+                        return Err(AadError::NonFiniteInput);
+                    }
+                    w.static_executed = completed;
+                    return Err(AadError::NonFiniteResult {
+                        node: usize::from(schedule.order[completed]),
+                    });
                 }
             }
-            if !w.adjoint[i].is_finite(){return Err(AadError::NonFiniteResult{node:i})}
+            w.static_executed = schedule.order.len();
+        } else {
+            self.lazy.run(&self.nodes, inputs, w)?;
         }
-        if let Some((i, _)) = w.adjoint.iter().enumerate().find(|(_, v)| !v.is_finite()) {
-            return Err(AadError::NonFiniteResult { node: i });
+        for (value, id) in w.output.iter_mut().zip(&self.outputs) {
+            *value = w.primal[id.0];
         }
-        if w.input_adjoints.iter().any(|v|!v.is_finite()){return Err(AadError::NonFiniteResult{node:0})}
+        Ok(())
+    }
+    /// Vector-Jacobian product: J(inputs)^T * output_seeds. Multiple outputs supported.
+    pub fn vjp<'a>(
+        &self,
+        inputs: &[f64],
+        output_seeds: &[f64],
+        w: &'a mut Workspace,
+    ) -> Result<&'a [f64], AadError> {
+        if output_seeds.len() != self.outputs.len() || output_seeds.iter().any(|v| !v.is_finite()) {
+            return Err(AadError::SeedShape);
+        }
+        self.preflight(inputs, w)?;
+        if let Some(schedule) = &self.straight_line {
+            if let Some((value, gradient)) = schedule
+                .sum_chain
+                .as_ref()
+                .and_then(|c| c.vjp(inputs, output_seeds[0]))
+            {
+                w.static_executed = schedule.order.len();
+                w.output[0] = value;
+                if w.uniform_gradient != Some(gradient) {
+                    w.input_adjoints.fill(gradient);
+                    w.uniform_gradient = Some(gradient);
+                }
+                return Ok(&w.input_adjoints);
+            }
+        }
+        self.evaluate_graph(inputs, w)?;
+        w.uniform_gradient = None;
+        let ranges = self
+            .straight_line
+            .as_ref()
+            .filter(|s| !s.blocks.is_empty())
+            .map_or(&[][..], |s| s.reset_ranges.as_ref());
+        reset_adjoints(&mut w.adjoint, ranges, 0.0);
+        // Every reachable input in a static schedule overwrites its own gradient.
+        // A lazy path can omit inputs that were reached on the previous call.
+        if self.straight_line.is_none() {
+            w.input_adjoints.fill(0.0);
+        }
+        for (&o, &seed) in self.outputs.iter().zip(output_seeds) {
+            w.adjoint[o.0] += seed;
+        }
+        match &self.straight_line {
+            Some(schedule) if !schedule.blocks.is_empty() => {
+                self.reverse_blocks(schedule, inputs, w)?
+            }
+            other => {
+                let order = other.as_ref().map_or(w.active.as_slice(), |s| &s.order);
+                self.reverse_slots(order, &w.primal, &mut w.adjoint, &mut w.input_adjoints)?;
+            }
+        }
         Ok(&w.input_adjoints)
     }
+
+    fn reverse_slots(
+        &self,
+        order: &[u16],
+        p: &[f64],
+        adj: &mut [f64],
+        gradients: &mut [f64],
+    ) -> Result<(), AadError> {
+        for &slot in order.iter().rev() {
+            let i = usize::from(slot);
+            let seed = adj[i];
+            if seed == 0.0 {
+                if let Op::Input(k) = self.nodes[i] {
+                    gradients[k] = 0.0;
+                }
+                continue;
+            }
+            // Every contribution targets an earlier executed node. Its final
+            // sum is available here, including seeds from repeated outputs.
+            if !seed.is_finite() {
+                return Err(AadError::NonFiniteResult { node: i });
+            }
+            match self.nodes[i] {
+                Op::Input(k) => gradients[k] = seed,
+                Op::Constant(_) | Op::Greater(..) => {}
+                Op::Add(a, b) => {
+                    adj[a] += seed;
+                    adj[b] += seed;
+                }
+                Op::Sub(a, b) => {
+                    adj[a] += seed;
+                    adj[b] -= seed;
+                }
+                Op::Mul(a, b) => {
+                    adj[a] += seed * p[b];
+                    adj[b] += seed * p[a];
+                }
+                Op::Div(a, b) => {
+                    adj[a] += seed / p[b];
+                    adj[b] += division_denominator_adjoint(seed, p[a], p[b]);
+                }
+                Op::Neg(a) => adj[a] -= seed,
+                Op::Exp(a) => adj[a] += seed * p[i],
+                Op::Ln(a) => adj[a] += seed / p[a],
+                Op::Min(a, b) => {
+                    if p[a] <= p[b] {
+                        adj[a] += seed
+                    } else {
+                        adj[b] += seed
+                    }
+                }
+                Op::Max(a, b) => {
+                    if p[a] >= p[b] {
+                        adj[a] += seed
+                    } else {
+                        adj[b] += seed
+                    }
+                }
+                Op::Select {
+                    condition,
+                    positive,
+                    zero,
+                } => {
+                    let selected = if p[condition] != 0.0 { positive } else { zero };
+                    adj[selected] += seed;
+                }
+            }
+        }
+        Ok(())
+    }
 }
+fn reset_adjoints<T: Copy>(adjoints: &mut [T], ranges: &[std::ops::Range<usize>], zero: T) {
+    if ranges.is_empty() {
+        adjoints.fill(zero);
+    } else {
+        for range in ranges {
+            adjoints[range.clone()].fill(zero);
+        }
+    }
+}
+
 /// Mutable per-worker cache. Do not share between concurrent evaluations.
-pub struct Workspace { primal:Vec<f64>,adjoint:Vec<f64>,visited:Vec<bool>,output:Vec<f64>,input_adjoints:Vec<f64>,stack:Vec<(NodeId,u8)>,active:Vec<usize>,graph_id:u64 }
+pub struct Workspace {
+    primal: Vec<f64>,
+    adjoint: Vec<f64>,
+    visited: Vec<bool>,
+    output: Vec<f64>,
+    input_adjoints: Vec<f64>,
+    stack: Vec<usize>,
+    active: Vec<u16>,
+    static_executed: usize,
+    uniform_gradient: Option<f64>,
+    graph_id: u64,
+}
 
 /// Observable allocation capacities for regression tests; these are not byte-accurate
 /// allocator measurements and do not guarantee allocation-free execution.
@@ -228,12 +593,12 @@ impl Workspace {
         }
     }
 
-    /// Number of nodes executed by the most recent forward or VJP call.
+    /// Number of forward nodes completed by the most recent evaluation.
     #[must_use]
-    pub fn executed_nodes(&self) -> usize { self.active.len() }
+    pub fn executed_nodes(&self) -> usize {
+        self.static_executed + self.active.len()
+    }
 }
-
-
 
 /// Compute -seed*numerator/denominator^2 without discarding a representable
 /// derivative when an intermediate product or square overflows/underflows.

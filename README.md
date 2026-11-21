@@ -1,10 +1,10 @@
 # rust-aad
 
-An **experimental** Rust reverse-mode AD library for reusable numerical computation graphs. The long-term research target is financial Monte Carlo throughput comparable to MatLogica AADC; **no such performance claim is currently substantiated**. XAD is an architecture reference, not a dependency.
+An **experimental** Rust reverse-mode AD library for reusable numerical computation graphs. It is designed for repeated value and gradient calculations in workloads such as financial Monte Carlo simulation.
 
 ## Status
 
-P1 prototype, not a released library. This bootstrap includes a small, zero-dependency `f64` graph interpreter with multiple outputs, arbitrary VJP seeds, lazy conditionals, and reusable per-worker workspace. It is **not yet** a full implementation of the parent Pricing Library's payoff graph and does not contain JIT, SIMD batch kernels, custom VJP, or checkpointing. No benchmark results have been produced.
+P1 prototype, not a released library. This bootstrap includes a small, default-feature zero-dependency `f64` graph interpreter with multiple outputs, arbitrary VJP seeds, lazy conditionals, and reusable per-worker workspace. It is **not yet** a full implementation of the parent Pricing Library's payoff graph and does not contain JIT, custom VJP, or checkpointing.
 
 ## Example
 
@@ -45,8 +45,8 @@ See [architecture](docs/architecture.md) and [benchmark plan](docs/benchmarks.md
 
 - Branches are lazy: inactive domain-invalid branches are not evaluated. For `select`, zero means false and any nonzero value means true; there is no adjoint to the selection condition.
 - `min`/`max` break ties to the left input. No special pathwise derivative is implied for digital discontinuities.
-- Evaluation uses an iterative task stack instead of Rust recursion. Deep-graph tests exist, but successful compilation and platform behavior still require CI validation.
-- Division reverse uses the straightforward formula and does not yet include the Pricing Library's scaled arithmetic for extreme exponents.
+- Compilation and evaluation handle deep graphs iteratively. The regression suite includes a 50,000-step dependency chain.
+- Division reverse uses exponent scaling for extreme finite operands.
 - Input validation rejects nonfinite values. The gradient seed and intermediate errors are checked but extreme cancellation/overflow paths require more adversarial testing.
 - The core forbids unsafe Rust and has no C++/Python dependencies.
 
@@ -56,19 +56,19 @@ MIT OR Apache-2.0.
 
 ## CI and baseline
 
-GitHub Actions tests on Linux, macOS, and Windows. Once this source is pushed to GitHub, open **Actions → Rust CI → Run workflow** to run a manual Linux interpreter-only benchmark and retrieve `aad-baseline-linux`. GitHub-hosted runner results are smoke measurements, not stable performance comparison evidence. The benchmark is run locally with `cargo run --release --example baseline -- 100000`.
+GitHub Actions tests on Linux, macOS, and Windows. Open **Actions → Rust CI → Run workflow** to run a manual Linux interpreter-only benchmark and retrieve `aad-baseline-linux`. GitHub-hosted runner results are smoke measurements, not stable performance comparison evidence. The benchmark is run locally with `cargo run --release --example baseline -- 100000`.
 
-Graph-local `NodeId`s reject foreign handles; VJP checks nonfinite adjoints. Evaluation is iterative, and the active execution trace is reused by the reverse sweep. No validated AADC parity is claimed.
+Graph-local `NodeId`s reject foreign handles; VJP checks nonfinite adjoints. Evaluation is iterative, and the active execution trace is reused by the reverse sweep.
 
 ## Development status (iterative graph evaluator)
 
-Graph evaluation now uses an explicit per-workspace stack rather than recursive Rust calls, preserving lazy selection of the active branch. Workspace identity is checked against the compiled graph, and regression tests cover deep graphs. The project is still experimental and has **not** demonstrated AADC-comparable performance. A Rust toolchain and CI run are required to validate compilation and behavior.
+Conditional graphs execute jumps to the chosen branch and use a per-workspace return stack for shared expressions. Workspace identity is checked against the compiled graph, and regression tests cover deep graphs.
 
 ## Reverse workspace and active-path sweep (experimental)
 
-`CompiledGraph::workspace()` preallocates the primal, adjoint, input-gradient, iterative evaluation stack and active-node buffers. Each forward call clears the active trace and records executed nodes in dependency-first order. VJP traverses only this active trace in reverse, rather than scanning every compiled node. A large branch not selected at runtime is not visited in reverse. `Workspace::executed_nodes()` and `Workspace::capacities()` expose simple diagnostics for regression tests; capacities alone do not prove zero allocations by the system allocator.
+Branch-free scalar graphs share a compiled sequence of reachable nodes across workers. Graphs with a reachable `select` follow compiled jumps and record the nodes executed on each path. Both modes reverse their forward order, preserving floating-point accumulation for shared nodes and repeated outputs. `Workspace::executed_nodes()` reports the forward count, including the completed prefix after a numerical error. The allocator regression measures workspace construction and reuse.
 
-The numeric semantics (tie-breaking for `min/max`, pathwise derivative through the chosen select branch, and error handling) remain experimental. The project has not yet been built or benchmarked in this conversation; CI execution is still required.
+The numeric semantics (tie-breaking for `min/max`, pathwise derivative through the chosen select branch, and error handling) remain experimental.
 
 ## Stable numerical adjoints (experimental)
 
@@ -79,3 +79,18 @@ silently emitting infinities or zeros. Truly nonfinite adjoints remain errors.
 Regression tests cover both exponent extremes and workspace recovery after an
 error. Correct rounding, cross-platform bitwise identity, and release quality
 are **not** claimed; run Rust CI before use.
+
+
+## Experimental two-path SIMD
+
+Enable `--features simd` and call `CompiledGraph::batch2()` once per worker.
+The result owns a prepared two-lane tape. Pass one `[f64; 2]` per input to
+`evaluate`, or pass inputs and one seed pair per output to `vjp`. Lane 0 and
+lane 1 are independent paths. Dispatch an odd final path to the scalar workspace.
+The kernel supports reachable constants, inputs, add, subtract, multiply and
+negate. A graph with any other reachable operation returns `None`; use the
+scalar evaluator for lazy branches, scaled division and transcendental functions.
+
+The [local benchmark matrix](docs/benchmarks.md#local-benchmark-matrix) checks
+every path's values and adjoints, measures setup, forward, VJP, allocations and
+peak memory, and exports binary fixtures for reproducible replay.
