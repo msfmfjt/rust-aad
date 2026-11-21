@@ -33,53 +33,28 @@ impl CompiledGraph {
     /// add, subtract, multiply and negate nodes. Returns `None` for graphs
     /// requiring other operations. Those graphs can use the scalar workspace.
     pub fn batch2(&self) -> Option<Batch2> {
-        // Follow the scalar evaluator's left-first, output-by-output order.
-        // Preserve the order of floating-point accumulation for shared nodes.
-        let mut slots = vec![None; self.nodes.len()];
-        let mut steps = Vec::new();
-        let mut stack = Vec::new();
-        for root in &self.outputs {
-            stack.push((root.0, false));
-            while let Some((i, ready)) = stack.pop() {
-                if slots[i].is_some() {
-                    continue;
-                }
-                let op = self.nodes[i];
-                if !ready {
-                    stack.push((i, true));
-                    match op {
-                        Op::Input(_) | Op::Constant(_) => {}
-                        Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) => {
-                            stack.push((b.0, false));
-                            stack.push((a.0, false));
-                        }
-                        Op::Neg(a) => stack.push((a.0, false)),
-                        _ => return None,
-                    }
-                    continue;
-                }
-                let op = match op {
-                    Op::Input(k) => Arithmetic::Input(k),
-                    Op::Constant(x) => Arithmetic::Constant(x),
-                    Op::Add(a, b) => Arithmetic::Add(slots[a.0]?, slots[b.0]?),
-                    Op::Sub(a, b) => Arithmetic::Sub(slots[a.0]?, slots[b.0]?),
-                    Op::Mul(a, b) => Arithmetic::Mul(slots[a.0]?, slots[b.0]?),
-                    Op::Neg(a) => Arithmetic::Neg(slots[a.0]?),
-                    _ => return None,
-                };
-                slots[i] = Some(steps.len());
-                steps.push(Step { source_node: i, op });
-            }
+        let order = self.straight_line.as_deref()?;
+        let mut slots = vec![0; self.nodes.len()];
+        let mut steps = Vec::with_capacity(order.len());
+        for &source in order {
+            let i = usize::from(source);
+            let op = match self.nodes[i] {
+                Op::Input(k) => Arithmetic::Input(k),
+                Op::Constant(x) => Arithmetic::Constant(x),
+                Op::Add(a, b) => Arithmetic::Add(slots[a], slots[b]),
+                Op::Sub(a, b) => Arithmetic::Sub(slots[a], slots[b]),
+                Op::Mul(a, b) => Arithmetic::Mul(slots[a], slots[b]),
+                Op::Neg(a) => Arithmetic::Neg(slots[a]),
+                _ => return None,
+            };
+            slots[i] = steps.len();
+            steps.push(Step { source_node: i, op });
         }
         Some(Batch2 {
             primal: vec![f64x2::ZERO; steps.len()],
             adjoint: vec![f64x2::ZERO; steps.len()],
             steps,
-            outputs: self
-                .outputs
-                .iter()
-                .map(|o| slots[o.0])
-                .collect::<Option<_>>()?,
+            outputs: self.outputs.iter().map(|o| slots[o.0]).collect(),
             values: vec![[0.0; 2]; self.output_count()],
             gradients: vec![[0.0; 2]; self.input_count()],
         })

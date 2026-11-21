@@ -34,10 +34,10 @@ Keep `#![forbid(unsafe_code)]` in the core. Do not promise bitwise identity acro
 
 ## Iterative evaluator constraints (experimental)
 
-The interpreter schedules each node using a two-stage explicit stack (plus a conditional-dispatch stage). It evaluates dependencies before their consumer and evaluates only the chosen branch for `Select`. The scratch stack is owned by the per-worker workspace, and it is cleared at the start of each forward or VJP call. This avoids native call-stack exhaustion for long sequential DAGs; it does not prove optimal CPU cache behavior or full memory-allocator elimination.
+The compiler traverses reachable nodes from the declared outputs in left-first dependency order. When this traversal encounters a select, the scalar interpreter evaluates each output on demand. It suspends a parent while computing an unvisited dependency and reads only the chosen arm of a select. A suspended frame holds one 16-bit node index. On graphs with a fixed traversal order, the compiler retains that order and workspaces replay it directly. Both traversals use explicit stacks to handle deep graphs.
 
 Tests include a 50,000-step dependency chain, an invalid inactive branch with 20,000 nested nodes, graph identity checks, and repeated VJP calls.
 
 ## Active execution trace for reverse (P1 iteration)
 
-During iterative evaluation, each newly computed node is appended to a workspace-owned `active` vector after its prerequisites. Reversing this order is a valid reverse topological sweep for all actually visited nodes, even when outputs share intermediate dependencies. VJP therefore no longer scans nodes excluded by lazy conditional execution. Both active-node and adjoint buffers are reused. The scratch array capacities can be inspected for regression testing, but this is not an allocator-level proof. Benchmark scalar execution separately from branch-heavy cases; active-vector writes may cost performance on fully active graphs.
+Branch-free graphs store a single forward order on the compiled graph. The SIMD arithmetic executor uses it when preparing its tape. Lazy evaluation records the active order in the workspace for each path. Reversing either order visits every consumer before its dependencies. A node's adjoint is therefore final when it is visited, and the reverse interpreter checks it for finiteness at that point. This also covers repeated output seeds. The primal and adjoint arrays and the input-gradient buffer are reused across calls.

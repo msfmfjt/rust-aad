@@ -50,6 +50,7 @@ fn main() {
         &[-1.0, 0.0]
     );
     check_reuse("error and recovery", region.change());
+    check_straight_line();
     #[cfg(feature = "simd")]
     check_batch();
 }
@@ -68,4 +69,19 @@ fn check_batch() {
         black_box(batch.vjp(&x, &[[0.5, -0.5], [1.0, 2.0]]).unwrap());
     }
     check_reuse("256 SIMD pairs per method", region.change());
+}
+
+fn check_straight_line() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let square = b.mul(x, x).unwrap();
+    let graph = b.compile(&[x, square]).unwrap();
+    let mut ws = graph.workspace();
+    let region = Region::new(ALLOCATOR);
+    for i in 0..256 {
+        let inputs = [f64::from(i)];
+        black_box(graph.evaluate(&inputs, &mut ws).unwrap());
+        black_box(graph.vjp(&inputs, &[0.5, 2.0], &mut ws).unwrap());
+    }
+    check_reuse("256 straight-line calls per method", region.change());
 }

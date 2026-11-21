@@ -263,3 +263,75 @@ fn division_adjoint_respects_signs_and_zero_seed() {
     assert_eq!(g.vjp(&[-8.0, -2.0], &[1.0], &mut w).unwrap(), &[-0.5, 2.0]);
     assert_eq!(g.vjp(&[1e300, 1e200], &[0.0], &mut w).unwrap(), &[0.0, 0.0]);
 }
+
+#[test]
+fn static_schedule_preserves_order_for_cancelling_adjoints_and_ignores_dead_branches() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let pos = b.constant(1e16).unwrap();
+    let neg = b.constant(-1e16).unwrap();
+    let one = b.constant(1.0).unwrap();
+    let large = b.mul(x, pos).unwrap();
+    let negative = b.mul(x, neg).unwrap();
+    let small = b.mul(x, one).unwrap();
+    let invalid = b.ln(neg).unwrap();
+    let _dead = b.select(one, invalid, small).unwrap();
+
+    // Reverse must add +1e16, -1e16, then +1. A descending node-index
+    // sweep loses the small contribution and returns zero.
+    let g = b.compile(&[small, negative, large, small]).unwrap();
+    let mut w = g.workspace();
+    assert_eq!(w.executed_nodes(), 0);
+    assert_eq!(
+        g.vjp(&[1.0], &[1.0, 1.0, 1.0, 0.0], &mut w).unwrap(),
+        &[1.0]
+    );
+    assert_eq!(w.executed_nodes(), 7);
+}
+
+#[test]
+fn static_schedule_reports_left_first_failure_and_completed_prefix() {
+    let mut b = GraphBuilder::new();
+    let x = b.input();
+    let first_built = b.ln(x).unwrap();
+    let one = b.constant(1.0).unwrap();
+    let shifted = b.add(x, one).unwrap();
+    let first_visited = b.ln(shifted).unwrap();
+    let root = b.add(first_visited, first_built).unwrap();
+    let g = b.compile(&[root]).unwrap();
+    let mut w = g.workspace();
+    assert_eq!(
+        g.evaluate(&[-2.0], &mut w),
+        Err(AadError::NonFiniteResult { node: 4 })
+    );
+    assert_eq!(w.executed_nodes(), 3);
+    assert_eq!(g.vjp(&[1.0], &[1.0], &mut w).unwrap(), &[1.5]);
+    assert_eq!(w.executed_nodes(), 6);
+}
+
+#[test]
+fn nonfinite_duplicate_seed_is_reported_even_at_a_constant() {
+    let mut b = GraphBuilder::new();
+    let constant = b.constant(2.0).unwrap();
+    let g = b.compile(&[constant, constant]).unwrap();
+    let mut w = g.workspace();
+    assert_eq!(
+        g.vjp(&[], &[f64::MAX; 2], &mut w),
+        Err(AadError::NonFiniteResult { node: 0 })
+    );
+    assert!(g.vjp(&[], &[1.0; 2], &mut w).unwrap().is_empty());
+}
+
+#[test]
+fn compact_schedule_accepts_the_last_representable_node() {
+    let mut b = GraphBuilder::new();
+    let mut out = b.input();
+    for _ in 0..u16::MAX {
+        out = b.neg(out).unwrap();
+    }
+    let g = b.compile(&[out]).unwrap();
+    let mut w = g.workspace();
+    assert_eq!(g.evaluate(&[2.0], &mut w).unwrap(), &[-2.0]);
+    assert_eq!(g.vjp(&[2.0], &[1.0], &mut w).unwrap(), &[-1.0]);
+    assert_eq!(w.executed_nodes(), usize::from(u16::MAX) + 1);
+}

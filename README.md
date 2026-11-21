@@ -66,7 +66,7 @@ Graph evaluation now uses an explicit per-workspace stack rather than recursive 
 
 ## Reverse workspace and active-path sweep (experimental)
 
-`CompiledGraph::workspace()` preallocates the primal, adjoint, input-gradient, iterative evaluation stack and active-node buffers. Each forward call clears the active trace and records executed nodes in dependency-first order. VJP traverses only this active trace in reverse, rather than scanning every compiled node. A large branch not selected at runtime is not visited in reverse. `Workspace::executed_nodes()` and `Workspace::capacities()` expose simple diagnostics for regression tests; capacities alone do not prove zero allocations by the system allocator.
+Branch-free scalar graphs share a compiled sequence of reachable nodes across workers. Graphs with a reachable `select` use a per-workspace stack and record the nodes executed on each path. Both modes reverse their forward order, preserving floating-point accumulation for shared nodes and repeated outputs. `Workspace::executed_nodes()` reports the forward count, including the completed prefix after a numerical error. The allocator regression measures workspace construction and reuse.
 
 The numeric semantics (tie-breaking for `min/max`, pathwise derivative through the chosen select branch, and error handling) remain experimental.
 
