@@ -169,3 +169,46 @@ reuses a tape object and records each path afresh. Its eleven timed sweeps
 include recording, forward evaluation, reverse and storing every path result.
 This differs from the Rust prepared-graph phases. The single-threaded snapshot
 below reports these phase boundaries separately.
+
+## Measured local snapshot, 2026-11-21
+
+Apple M3 Max (arm64), single worker, Rust 1.98.1 release, with default Rust
+target flags. The generic Rust suite used b7d15ce and the Pricing reference
+used 16799c5, whose production crates match f82a8b2. Each row below gives the
+median of 11 warmed samples. On the 10,000-path affine32-v1 graph:
+
+| Backend | Forward over all paths | Forward + seeded VJP | Hot VJP allocations |
+|---|---:|---:|---:|
+| rust-aad scalar | 4.675 ms | 6.953 ms | 0 |
+| rust-aad SIMD, two paths per batch | 1.447 ms | 3.227 ms | 0 |
+| Pricing Library native | 3.637 ms | 10.721 ms | 60,000 |
+
+At 120 observations and one million paths, scalar rust-aad took 1.260 s
+forward and 1.948 s forward + VJP. Pricing took 0.648 s and 2.045 s.
+The timing-process peak RSS values were 962,428,928 and 963,018,752 bytes,
+including 960 MB of prepacked inputs. Across the full 22 rust-aad records,
+each warmed forward and forward + VJP reported zero allocations and
+reallocations. These measurements apply to the registered shapes on this host.
+
+The public XAD 2.2.0 tape driver validated all 40,000 affine output and adjoint
+values and measured 2.592 ms for its record/forward/reverse/store pass. The
+XAD driver uses Apple Clang 21 with the flags in its result file. The
+standalone Rust timings use reusable compiled graphs. AADC and XAD JIT
+measurements remain open.
+
+Native application medians were 0.548 ms and 0.539 ms for complete 32-path
+forward + path pullback on the 120-step one- and two-factor Bergomi fixtures.
+On 256 particles, finite LSV calibration took 0.065 ms and the calibration
+VJP took 0.029 ms. Hull–White with calibrated LSV took 0.422 ms for price and
+all native risks over 64 independent antithetic units. These are measurements
+of the existing Pricing Library implementations.
+
+Full records include individual samples, intervals, memory and numerical
+outputs. The Rust matrices are gzipped JSON Lines. The application fixture and
+native comparison sources are on the separate Pricing integration PR.
+
+- [Generic Rust measurements](../benchmarks/evidence/m3-max-2026-11-21/local-rust.jsonl.gz)
+- [Native Pricing measurements](../benchmarks/evidence/m3-max-2026-11-21/local-pricing.jsonl.gz)
+- [Native application measurements](../benchmarks/evidence/m3-max-2026-11-21/local-models.jsonl.gz)
+- [XAD tape measurements and build flags](../benchmarks/evidence/m3-max-2026-11-21/xad-tape.json)
+- [Pricing reference and application fixtures](https://github.com/msfmfjt/rust-pricing-library/tree/16799c5bfdac3be1e3a06fa996fe8e35836221ad/verification/standalone-aad)

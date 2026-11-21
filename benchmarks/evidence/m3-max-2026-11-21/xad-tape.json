@@ -1,0 +1,39 @@
+{
+  "workload": "affine32-v1",
+  "backend": "xad-tape",
+  "paths": 10000,
+  "verified_paths": 10000,
+  "input_fnv1a64": "a7bf6211c9ab67d9",
+  "phase": "record_forward_vjp_store",
+  "samples_ns": [
+    2910459,
+    2729541,
+    2721083,
+    2625750,
+    2593667,
+    2585792,
+    2564416,
+    2535167,
+    2525792,
+    2592083,
+    2519042
+  ],
+  "median_ns": 2592083,
+  "host": {
+    "system": "Darwin",
+    "os_version": "Darwin Kernel Version 27.0.0: Tue Aug 11 21:05:42 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6031",
+    "arch": "arm64",
+    "cpu": "Apple M3 Max",
+    "cpu_features": "neon arm.FEAT_FP16 arm.FEAT_DotProd arm.FEAT_LSE",
+    "threads": 1
+  },
+  "driver_revision": "b3030ff8101efa20f3087592a602b235a5c11213",
+  "xad_version": "2.2.0",
+  "xad_revision": "aaf4e9cad59cf1bfe9728b491f95f011db687f18",
+  "peak_rss_bytes": 6668288,
+  "compiler": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "driver_flags": "-O3 -DNDEBUG -std=gnu++20 -mmacosx-version-min=14.0 -ffp-contract=off",
+  "xad_flags": "-O3 -DNDEBUG -mmacosx-version-min=14.0 -fPIC -Wall -Wshadow -Wconversion -stdlib=libc++ -mmacosx-version-min=10.9 -march=armv8.5-a",
+  "output_sha256": "1ad4ae3edfab8e9ab5ae3f96f98b237c998abd06319334d185b622309d8c7fd3",
+  "driver_binary_sha256": "2492337c238b297c389d9078feb6c9cae36dda2c40832ef594176e9bb1b6e642"
+}
