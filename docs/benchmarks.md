@@ -265,3 +265,46 @@ direction specified. If setup is material, compare total time for a specified
 number of replays as measured setup plus that number times the warm batch
 time. Figures from other hardware or different workloads cannot establish
 performance parity on this matrix.
+
+## Scalar traversal tuning on Apple M3 Max
+
+On the same Apple M3 Max (macOS 27.0.1), compare `bb27c46` and `6c07966`
+with Rust 1.98.1 release builds, default target flags and one worker. Both use
+the same locked benchmark package and prepacked binary64 inputs. Fixed scalar
+graphs now compile their reachable execution order once. Dynamic graphs
+retain a compact stack of suspended parents and a 16-bit active-node trace.
+
+| Scalar workload | Paths | Forward before → after | Forward + VJP before → after |
+|---|---:|---:|---:|
+| Two-output affine, 32 steps | 10,000 | 4.37 → 1.85 ms | 6.87 → 4.29 ms |
+| Average, 120 observations | 10,000 | 12.41 → 4.68 ms | 19.26 → 8.27 ms |
+| Two outputs, 1,000 inputs | 10,000 | 207.52 → 74.13 ms | 352.98 → 175.76 ms |
+| Lazy branch, 50% early exit | 10,000 | 4.20 → 4.43 ms | 6.57 → 6.14 ms |
+| Average, 120 observations | 1,000,000 | 1.275 → 0.483 s | 1.936 → 0.858 s |
+
+The 10,000-path matrix covers 11 scalar and five SIMD cases. Each binary ran
+one warm-up and 11 samples per phase. Four paired runs alternated the order
+of binaries and workloads. The table reports the median of the four per-run
+medians. The million-path case ran one pair, baseline first. For reproduction,
+build each revision with `cargo +1.98.1 build --release --locked --manifest-path
+benchmarks/Cargo.toml` and run its `rust-aad-bench BACKEND WORKLOAD PATHS`
+executable for each case. Recording, workspace setup and validation are outside
+the two displayed timers.
+
+Recording/compilation for the 120-observation graph increased from 1.23 to
+2.38 µs. Workspace construction for that graph fell from 9,086 to 4,904
+requested bytes and from seven to four allocations. The separate 1,030-node
+lazy allocation regression fell from 34,022 to 21,662 requested bytes. Across
+all 16 cases, both binaries recorded zero allocations and reallocations in
+warm forward and VJP, including when writing results into preallocated arrays.
+Every output and seeded input derivative agreed with its oracle. The complete
+10,000-path result streams from the two revisions were byte-identical for
+each backend and workload.
+
+Gains varied with the graph. Forward alone took about 4–5% longer on the 50%
+and 99% early-exit cases. Both saw about 7% higher throughput for forward +
+VJP. The two-lane SIMD arithmetic kernels used their existing execution
+strategy. Their warm VJP medians ranged from nearly unchanged on affine to
+7% longer on the 100-input case.
+
+[Raw timings, setup and allocation counts, result digests and build metadata](../benchmarks/evidence/m3-max-2026-11-21/scalar-traversal.json.gz)
