@@ -8,6 +8,10 @@ use std::{
 };
 
 mod blocks;
+mod lazy;
+mod moments;
+mod ordered_sum;
+mod recurrence;
 mod sum_chain;
 use blocks::Block;
 use sum_chain::SumChain;
@@ -46,6 +50,26 @@ enum Op {
 }
 
 impl Op {
+    fn operands(self) -> impl DoubleEndedIterator<Item = usize> {
+        let children = match self {
+            Self::Input(_) | Self::Constant(_) => [None; 3],
+            Self::Neg(a) | Self::Exp(a) | Self::Ln(a) => [Some(a), None, None],
+            Self::Add(a, b)
+            | Self::Sub(a, b)
+            | Self::Mul(a, b)
+            | Self::Div(a, b)
+            | Self::Greater(a, b)
+            | Self::Min(a, b)
+            | Self::Max(a, b) => [Some(a), Some(b), None],
+            Self::Select {
+                condition,
+                positive,
+                zero,
+            } => [Some(condition), Some(positive), Some(zero)],
+        };
+        children.into_iter().flatten()
+    }
+
     #[inline]
     fn value(self, inputs: &[f64], p: &[f64]) -> f64 {
         match self {
@@ -90,21 +114,10 @@ fn straight_line_order(nodes: &[Op], outputs: &[NodeId]) -> Option<Box<[u16]>> {
             }
             if !finish {
                 stack.push((i, true));
-                match nodes[i] {
-                    Op::Input(_) | Op::Constant(_) => {}
-                    Op::Neg(a) | Op::Exp(a) | Op::Ln(a) => stack.push((a, false)),
-                    Op::Add(a, b)
-                    | Op::Sub(a, b)
-                    | Op::Mul(a, b)
-                    | Op::Div(a, b)
-                    | Op::Min(a, b)
-                    | Op::Max(a, b)
-                    | Op::Greater(a, b) => {
-                        stack.push((b, false));
-                        stack.push((a, false));
-                    }
-                    Op::Select { .. } => return None,
+                if matches!(nodes[i], Op::Select { .. }) {
+                    return None;
                 }
+                stack.extend(nodes[i].operands().rev().map(|child| (child, false)));
             } else {
                 visited[i] = true;
                 order.push(i as u16);
@@ -253,14 +266,22 @@ impl GraphBuilder {
                 .count()
                 == self.input_count;
             let sum_chain = SumChain::compile(&self.nodes, outputs, &blocks, self.input_count);
+            let reset_ranges = Block::reset_ranges(&blocks, &order, self.nodes.len(), |slot| slot);
             StaticSchedule {
+                reset_ranges,
                 sum_chain,
                 order,
                 blocks,
                 covers_all_inputs,
             }
         });
+        let lazy = if straight_line.is_none() {
+            lazy::Program::compile(&self.nodes, outputs)
+        } else {
+            lazy::Program::default()
+        };
         Ok(CompiledGraph {
+            lazy,
             straight_line,
             nodes: self.nodes.into_boxed_slice(),
             outputs: outputs.into(),
@@ -271,6 +292,7 @@ impl GraphBuilder {
 }
 
 struct StaticSchedule {
+    reset_ranges: Box<[std::ops::Range<usize>]>,
     sum_chain: Option<SumChain>,
     covers_all_inputs: bool,
     order: Box<[u16]>,
@@ -279,6 +301,7 @@ struct StaticSchedule {
 
 /// Immutable graph, shareable across workers. Each worker needs its own Workspace.
 pub struct CompiledGraph {
+    lazy: lazy::Program,
     straight_line: Option<StaticSchedule>,
     nodes: Box<[Op]>,
     outputs: Box<[NodeId]>,
@@ -307,7 +330,7 @@ impl CompiledGraph {
             visited: vec![false; dynamic_nodes],
             output: vec![0.0; self.outputs.len()],
             input_adjoints: vec![0.0; self.input_count],
-            stack: Vec::with_capacity(dynamic_nodes),
+            stack: Vec::with_capacity(self.lazy.call_capacity),
             active: Vec::with_capacity(dynamic_nodes),
             static_executed: 0,
             uniform_gradient: Some(0.0),
@@ -334,57 +357,6 @@ impl CompiledGraph {
             return Err(AadError::InvalidWorkspace);
         }
         Ok(())
-    }
-    // Suspend only the parent while descending to its first missing dependency.
-    // On return, the completed child is memoised, including across output roots.
-    fn eval(&self, id: NodeId, inputs: &[f64], w: &mut Workspace) -> Result<f64, AadError> {
-        let mut i = id.0;
-        if w.visited[i] {
-            return Ok(w.primal[i]);
-        }
-        loop {
-            let op = self.nodes[i];
-            let missing = |j: usize| (!w.visited[j]).then_some(j);
-            let child = match op {
-                Op::Input(_) | Op::Constant(_) => None,
-                Op::Neg(a) | Op::Exp(a) | Op::Ln(a) => missing(a),
-                Op::Add(a, b)
-                | Op::Sub(a, b)
-                | Op::Mul(a, b)
-                | Op::Div(a, b)
-                | Op::Greater(a, b)
-                | Op::Min(a, b)
-                | Op::Max(a, b) => missing(a).or_else(|| missing(b)),
-                Op::Select {
-                    condition,
-                    positive,
-                    zero,
-                } => missing(condition).or_else(|| {
-                    missing(if w.primal[condition] != 0.0 {
-                        positive
-                    } else {
-                        zero
-                    })
-                }),
-            };
-            if let Some(child) = child {
-                w.stack.push(i as u16);
-                i = child;
-                continue;
-            }
-            let value = op.value(inputs, &w.primal);
-            if !value.is_finite() {
-                w.stack.clear();
-                return Err(AadError::NonFiniteResult { node: i });
-            }
-            w.primal[i] = value;
-            w.visited[i] = true;
-            w.active.push(i as u16);
-            match w.stack.pop() {
-                Some(parent) => i = usize::from(parent),
-                None => return Ok(value),
-            }
-        }
     }
     fn evaluate_slots(
         &self,
@@ -438,16 +410,11 @@ impl CompiledGraph {
                 }
             }
             w.static_executed = schedule.order.len();
-            for (value, id) in w.output.iter_mut().zip(&self.outputs) {
-                *value = w.primal[id.0];
-            }
         } else {
-            w.visited.fill(false);
-            w.stack.clear();
-            w.active.clear();
-            for (k, &id) in self.outputs.iter().enumerate() {
-                w.output[k] = self.eval(id, inputs, w)?;
-            }
+            self.lazy.run(&self.nodes, inputs, w)?;
+        }
+        for (value, id) in w.output.iter_mut().zip(&self.outputs) {
+            *value = w.primal[id.0];
         }
         Ok(())
     }
@@ -479,7 +446,12 @@ impl CompiledGraph {
         }
         self.evaluate_graph(inputs, w)?;
         w.uniform_gradient = None;
-        w.adjoint.fill(0.0);
+        let ranges = self
+            .straight_line
+            .as_ref()
+            .filter(|s| !s.blocks.is_empty())
+            .map_or(&[][..], |s| s.reset_ranges.as_ref());
+        reset_adjoints(&mut w.adjoint, ranges, 0.0);
         // Every reachable input in a static schedule overwrites its own gradient.
         // A lazy path can omit inputs that were reached on the previous call.
         if self.straight_line.is_none() {
@@ -489,7 +461,9 @@ impl CompiledGraph {
             w.adjoint[o.0] += seed;
         }
         match &self.straight_line {
-            Some(schedule) if !schedule.blocks.is_empty() => self.reverse_blocks(schedule, w)?,
+            Some(schedule) if !schedule.blocks.is_empty() => {
+                self.reverse_blocks(schedule, inputs, w)?
+            }
             other => {
                 let order = other.as_ref().map_or(w.active.as_slice(), |s| &s.order);
                 self.reverse_slots(order, &w.primal, &mut w.adjoint, &mut w.input_adjoints)?;
@@ -568,6 +542,16 @@ impl CompiledGraph {
         Ok(())
     }
 }
+fn reset_adjoints<T: Copy>(adjoints: &mut [T], ranges: &[std::ops::Range<usize>], zero: T) {
+    if ranges.is_empty() {
+        adjoints.fill(zero);
+    } else {
+        for range in ranges {
+            adjoints[range.clone()].fill(zero);
+        }
+    }
+}
+
 /// Mutable per-worker cache. Do not share between concurrent evaluations.
 pub struct Workspace {
     primal: Vec<f64>,
@@ -575,7 +559,7 @@ pub struct Workspace {
     visited: Vec<bool>,
     output: Vec<f64>,
     input_adjoints: Vec<f64>,
-    stack: Vec<u16>,
+    stack: Vec<usize>,
     active: Vec<u16>,
     static_executed: usize,
     uniform_gradient: Option<f64>,

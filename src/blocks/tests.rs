@@ -204,3 +204,105 @@ fn cancelling_primals_still_check_shared_constant_adjoints() {
     );
     check(&mut g, &mut w, &mut reference, &[0.0; 8], &[1.0]).unwrap();
 }
+
+#[test]
+fn paired_moments_replay_overflow_and_refresh_partial_gradients() {
+    let mut b = GraphBuilder::new();
+    let x: Vec<_> = (0..24).map(|_| b.input()).collect();
+    let zero = b.constant(0.0).unwrap();
+    let (mut sum, mut squares) = (zero, zero);
+    let mut first_square = zero;
+    for (i, &leaf) in x.iter().enumerate() {
+        sum = b.add(sum, leaf).unwrap();
+        let square = b.mul(leaf, leaf).unwrap();
+        if i == 0 {
+            first_square = square;
+        }
+        squares = b.add(squares, square).unwrap();
+    }
+    let mut g = b.compile(&[sum, squares, sum]).unwrap();
+    let schedule = g.straight_line.as_ref().unwrap();
+    assert!(
+        schedule
+            .blocks
+            .iter()
+            .any(|r| matches!(r, Block::Moments(_)))
+    );
+    assert!(!schedule.reset_ranges.is_empty());
+    let (mut w, mut reference) = (g.workspace(), g.workspace());
+    let mut inputs: [f64; 24] = std::array::from_fn(|i| (i as f64).sin());
+    for seeds in [
+        [0.125, -2.25, 0.0],
+        [1.0, 0.0, -1.0],
+        [0.0; 3],
+        [1e85, -1e84, -1e85],
+    ] {
+        check(&mut g, &mut w, &mut reference, &inputs, &seeds).unwrap();
+    }
+    inputs.fill(1e152);
+    assert_eq!(
+        check(&mut g, &mut w, &mut reference, &inputs, &[0.0, 1e200, 0.0]),
+        Err(AadError::NonFiniteResult { node: x[23].0 })
+    );
+    inputs[0] = 1e200;
+    assert_eq!(
+        check(&mut g, &mut w, &mut reference, &inputs, &[0.0; 3]),
+        Err(AadError::NonFiniteResult {
+            node: first_square.0
+        })
+    );
+    check(&mut g, &mut w, &mut reference, &[-0.0; 24], &[-0.0; 3]).unwrap();
+}
+
+#[test]
+fn recurrence_splits_at_observed_states_and_checks_intermediate_adjoints() {
+    let mut b = GraphBuilder::new();
+    let (x, q, bias) = (b.input(), b.input(), b.input());
+    let mut state = x;
+    let mut states = Vec::new();
+    for _ in 0..20 {
+        let product = b.mul(state, q).unwrap();
+        state = b.add(product, bias).unwrap();
+        states.push(state);
+    }
+    let mut g = b.compile(&[state, states[10], state]).unwrap();
+    assert_eq!(
+        g.straight_line
+            .as_ref()
+            .unwrap()
+            .blocks
+            .iter()
+            .filter(|r| matches!(r, Block::Recurrence(_)))
+            .count(),
+        2
+    );
+    let (mut w, mut reference) = (g.workspace(), g.workspace());
+    for scale in [-0.0, 0.125, -0.75, 1.0, 1.625] {
+        check(
+            &mut g,
+            &mut w,
+            &mut reference,
+            &[1.0, scale, 0.125],
+            &[1.75, -2.5, 0.3],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        check(
+            &mut g,
+            &mut w,
+            &mut reference,
+            &[0.0, 2.0, 0.0],
+            &[f64::MAX, 0.0, 0.0]
+        ),
+        Err(AadError::NonFiniteResult { node: states[18].0 })
+    );
+    check(
+        &mut g,
+        &mut w,
+        &mut reference,
+        &[-0.0, -1.0, -0.0],
+        &[-0.0; 3],
+    )
+    .unwrap();
+}

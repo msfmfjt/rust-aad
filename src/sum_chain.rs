@@ -93,7 +93,7 @@ impl SumChain {
     // A winning constant cuts the only path from the output to the sum.
     // A tie keeps the left operand, exactly as in primitive reverse execution.
     pub(super) fn evaluate(&self, inputs: &[f64]) -> Option<(f64, bool)> {
-        let mut value = inputs.iter().fold(self.initial, |a, b| a + b);
+        let mut value = crate::ordered_sum::ordered_sum(self.initial, inputs);
         let mut active = true;
         if !self.within_bound(value) {
             return None;

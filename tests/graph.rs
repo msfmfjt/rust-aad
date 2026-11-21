@@ -359,3 +359,30 @@ fn nonfinite_input_precedes_node_failure_and_preserves_the_last_trace() {
     assert_eq!(w.executed_nodes(), 1);
     assert_eq!(g.vjp(&[1.0, 2.0], &[0.0], &mut w).unwrap(), &[0.0; 2]);
 }
+
+#[test]
+fn lazy_shared_calls_memoize_across_roots_and_recover_after_nested_failure() {
+    let mut b = GraphBuilder::new();
+    let (x, gate) = (b.input(), b.input());
+    let square = b.mul(x, x).unwrap();
+    let double = b.add(square, square).unwrap();
+    let log = b.ln(x).unwrap();
+    let selected = b.select(gate, log, double).unwrap();
+    let root = b.add(selected, double).unwrap();
+    let g = b.compile(&[root, selected, root]).unwrap();
+    let mut w = g.workspace();
+    let seeds = [0.5, 1.0, 0.5];
+    assert_eq!(
+        g.evaluate(&[-2.0, -0.0], &mut w).unwrap(),
+        &[16.0, 8.0, 16.0]
+    );
+    assert_eq!(w.executed_nodes(), 6);
+    assert_eq!(g.vjp(&[-2.0, 0.0], &seeds, &mut w).unwrap(), &[-24.0, 0.0]);
+    assert_eq!(
+        g.vjp(&[-2.0, 1.0], &seeds, &mut w),
+        Err(AadError::NonFiniteResult { node: 4 })
+    );
+    assert_eq!(w.executed_nodes(), 2);
+    assert_eq!(g.vjp(&[1.0, 1.0], &seeds, &mut w).unwrap(), &[6.0, 0.0]);
+    assert_eq!(w.executed_nodes(), 7);
+}

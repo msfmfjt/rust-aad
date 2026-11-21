@@ -10,9 +10,31 @@ fn main() {
     let mut workspace = graph.workspace();
     let mut inputs = Vec::with_capacity(paths * n);
     let mut seeds = Vec::with_capacity(paths);
+    let mut full_precision = false;
+    let mut unit_seed = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--full-precision" => full_precision = true,
+            "--unit-seed" => unit_seed = true,
+            _ => panic!("unknown option {arg}"),
+        }
+    }
+    let mut state = 43_u64;
     for path in 0..paths {
-        inputs.extend((0..n).map(|i| case.input(path, i)));
-        seeds.push([1.0 + path as f64 / paths as f64]);
+        inputs.extend((0..n).map(|i| {
+            let value = case.input(path, i);
+            if full_precision {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                f64::from_bits(value.to_bits() | (state >> 34))
+            } else {
+                value
+            }
+        }));
+        seeds.push([if unit_seed {
+            1.0
+        } else {
+            1.0 + path as f64 / paths as f64
+        }]);
     }
     let mut value = [0.0];
     let mut gradient = vec![0.0; n];

@@ -24,6 +24,7 @@ struct Step {
 pub struct Batch2 {
     steps: Vec<Step>,
     regions: Box<[Region]>,
+    reset_ranges: Box<[std::ops::Range<usize>]>,
     covers_all_inputs: bool,
     outputs: Vec<usize>,
     primal: Vec<f64x2>,
@@ -56,6 +57,9 @@ impl CompiledGraph {
             steps.push(Step { source_node: i, op });
         }
         Some(Batch2 {
+            reset_ranges: crate::Block::reset_ranges(&schedule.blocks, order, steps.len(), |id| {
+                slots[id]
+            }),
             regions: schedule
                 .blocks
                 .iter()
@@ -132,14 +136,19 @@ impl Batch2 {
         }
         self.evaluate(inputs)?;
         let adj = &mut self.adjoint;
-        adj.fill(f64x2::ZERO);
+        let ranges = if self.regions.is_empty() {
+            &[][..]
+        } else {
+            &self.reset_ranges
+        };
+        crate::reset_adjoints(adj, ranges, f64x2::ZERO);
         for (&o, &pair) in self.outputs.iter().zip(seeds) {
             adj[o] += f64x2::new(pair);
         }
         if self.regions.is_empty() {
             Self::reverse_steps(&self.steps, 0, &self.primal, adj, &mut self.gradients)?;
         } else {
-            self.reverse_regions()?;
+            self.reverse_regions(inputs)?;
         }
         Ok(&self.gradients)
     }

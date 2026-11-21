@@ -1,10 +1,14 @@
 //! Translate scalar reduction blocks to the compact two-lane tape at preparation.
 use super::{Batch2, f64x2};
+use crate::moments::Moments;
+use crate::recurrence::Recurrence;
 use crate::{AadError, Block};
 use std::ops::Range;
 
 pub(super) enum Region {
     Steps(Range<usize>),
+    Moments(Moments),
+    Recurrence(Recurrence),
     Sum {
         initial: usize,
         output: usize,
@@ -22,6 +26,8 @@ pub(super) enum Region {
 impl Region {
     pub(super) fn prepare(block: &Block, slots: &[usize]) -> Self {
         match block {
+            Block::Recurrence(run) => Self::Recurrence(run.compact(slots)),
+            Block::Moments(m) => Self::Moments(m.compact(slots)),
             Block::Scalar(range) => Self::Steps(range.clone()),
             Block::InputSum {
                 initial,
@@ -59,6 +65,22 @@ impl Batch2 {
         for region in &self.regions {
             let p = &mut self.primal;
             let (output, value) = match region {
+                Region::Recurrence(run) => {
+                    if !run.forward(p) {
+                        return Err(AadError::NonFiniteResult {
+                            node: self.steps[run.output()].source_node,
+                        });
+                    }
+                    continue;
+                }
+                Region::Moments(m) => {
+                    if !m.forward(inputs, p) {
+                        return Err(AadError::NonFiniteResult {
+                            node: self.steps[m.square_output].source_node,
+                        });
+                    }
+                    continue;
+                }
                 Region::Steps(range) => {
                     Self::forward_steps(&self.steps[range.clone()], range.start, inputs, p)?;
                     continue;
@@ -105,10 +127,23 @@ impl Batch2 {
         Ok(())
     }
 
-    pub(super) fn reverse_regions(&mut self) -> Result<(), AadError> {
+    pub(super) fn reverse_regions(&mut self, inputs: &[[f64; 2]]) -> Result<(), AadError> {
         let adj = &mut self.adjoint;
         for region in self.regions.iter().rev() {
             match region {
+                Region::Recurrence(run) => {
+                    run.reverse(&self.primal, adj)
+                        .map_err(|slot| AadError::NonFiniteResult {
+                            node: self.steps[slot].source_node,
+                        })?
+                }
+                Region::Moments(m) => m.reverse(
+                    inputs,
+                    adj,
+                    &mut self.gradients,
+                    self.steps[m.sum_output].source_node,
+                    self.steps[m.square_output].source_node,
+                )?,
                 Region::Steps(range) => Self::reverse_steps(
                     &self.steps[range.clone()],
                     range.start,

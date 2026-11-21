@@ -1,9 +1,36 @@
 //! Order-preserving loops for regular sections of a static graph.
 use super::{AadError, CompiledGraph, NodeId, Op, StaticSchedule, Workspace};
-use std::ops::Range;
+use crate::moments::Moments;
+use crate::recurrence::Recurrence;
+use std::ops::{Add, Mul, Range};
+
+pub(crate) trait BlockValue:
+    Copy + Add<Output = Self> + Mul<Output = Self> + From<Self::Stored> + Into<Self::Stored>
+{
+    type Stored: Copy;
+    const ZERO: Self;
+    fn finite(self) -> bool;
+}
+impl BlockValue for f64 {
+    type Stored = f64;
+    const ZERO: Self = 0.0;
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+}
+#[cfg(feature = "simd")]
+impl BlockValue for wide::f64x2 {
+    type Stored = [f64; 2];
+    const ZERO: Self = Self::ZERO;
+    fn finite(self) -> bool {
+        self.is_finite().all()
+    }
+}
 
 pub(super) enum Block {
     Scalar(Range<usize>),
+    Moments(Moments),
+    Recurrence(Recurrence),
     Dot {
         initial: usize,
         output: usize,
@@ -27,20 +54,8 @@ impl Block {
         // Count output handles as uses, including multiple handles to one slot.
         let mut uses = vec![0usize; nodes.len()];
         for &slot in order {
-            match nodes[usize::from(slot)] {
-                Op::Input(_) | Op::Constant(_) => {}
-                Op::Neg(a) | Op::Ln(a) | Op::Exp(a) => uses[a] += 1,
-                Op::Add(a, b)
-                | Op::Sub(a, b)
-                | Op::Mul(a, b)
-                | Op::Div(a, b)
-                | Op::Greater(a, b)
-                | Op::Min(a, b)
-                | Op::Max(a, b) => {
-                    uses[a] += 1;
-                    uses[b] += 1;
-                }
-                Op::Select { .. } => unreachable!("static schedules exclude select"),
+            for child in nodes[usize::from(slot)].operands() {
+                uses[child] += 1;
             }
         }
         for out in outputs {
@@ -52,14 +67,25 @@ impl Block {
             let remaining = &order[i..];
             let region = match nodes[usize::from(remaining[0])] {
                 Op::Input(_) => Self::input_sum(nodes, &uses, remaining),
-                Op::Mul(..) => Self::dot(nodes, &uses, remaining),
+                Op::Mul(..) => Self::dot(nodes, &uses, remaining).or_else(|| {
+                    Recurrence::compile(nodes, &uses, remaining)
+                        .map(|(run, n)| (Self::Recurrence(run), n))
+                }),
                 _ => None,
             };
             if let Some((block, consumed)) = region {
                 if scalar_start < i {
                     blocks.push(Self::Scalar(scalar_start..i));
                 }
-                blocks.push(block);
+                if let Some(moments) = blocks
+                    .last()
+                    .and_then(|last| Self::moments(last, &block, &uses))
+                {
+                    blocks.pop();
+                    blocks.push(Self::Moments(moments));
+                } else {
+                    blocks.push(block);
+                }
                 i += consumed;
                 scalar_start = i;
             } else {
@@ -73,6 +99,101 @@ impl Block {
             blocks.push(Self::Scalar(scalar_start..order.len()));
         }
         blocks.into_boxed_slice()
+    }
+
+    fn moments(sum: &Self, dot: &Self, uses: &[usize]) -> Option<Moments> {
+        let Self::InputSum {
+            initial: sum_initial,
+            output: sum_output,
+            inputs,
+            slots,
+            ..
+        } = sum
+        else {
+            return None;
+        };
+        let Self::Dot {
+            initial: square_initial,
+            output: square_output,
+            left,
+            right,
+        } = dot
+        else {
+            return None;
+        };
+        // The leaves have no other readers or output seeds. The second initializer
+        // must already be available when the two passes begin.
+        if slots != left
+            || slots != right
+            || square_initial == sum_output
+            || !uses[slots.clone()].iter().all(|&n| n == 3)
+        {
+            return None;
+        }
+        Some(Moments {
+            inputs: inputs.clone(),
+            first_node: slots.start,
+            sum_initial: *sum_initial,
+            square_initial: *square_initial,
+            sum_output: *sum_output,
+            square_output: *square_output,
+        })
+    }
+
+    // Every reachable adjoint has one defining step. Fused intermediates
+    // have no outside consumers, and reverse never reads their scratch slots.
+    pub(super) fn reset_ranges(
+        blocks: &[Block],
+        order: &[u16],
+        slots: usize,
+        map: impl Fn(usize) -> usize,
+    ) -> Box<[Range<usize>]> {
+        if blocks.is_empty() || slots < 32 {
+            return Box::default();
+        }
+        let mut live = vec![false; slots];
+        for block in blocks {
+            match block {
+                Self::Scalar(range) => {
+                    for &id in &order[range.clone()] {
+                        live[map(usize::from(id))] = true;
+                    }
+                }
+                Self::InputSum {
+                    output,
+                    slots: leaves,
+                    shared,
+                    ..
+                } => {
+                    live[map(*output)] = true;
+                    if *shared {
+                        for leaf in leaves.clone() {
+                            live[map(leaf)] = true;
+                        }
+                    }
+                }
+                Self::Recurrence(run) => live[map(run.output())] = true,
+                Self::Dot { output, .. } => live[map(*output)] = true,
+                Self::Moments(m) => {
+                    live[map(m.sum_output)] = true;
+                    live[map(m.square_output)] = true;
+                }
+            }
+        }
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for (slot, used) in live.into_iter().enumerate() {
+            if used {
+                match ranges.last_mut() {
+                    Some(r) if slot < r.end + 8 => r.end = slot + 1,
+                    _ => ranges.push(slot..slot + 1),
+                }
+            }
+        }
+        if ranges.iter().map(Range::len).sum::<usize>() > slots / 2 {
+            Box::default()
+        } else {
+            ranges.into()
+        }
     }
 
     // Fold products of two contiguous primal slices, including overlapping
@@ -166,6 +287,16 @@ impl CompiledGraph {
     ) -> bool {
         for block in &schedule.blocks {
             match block {
+                Block::Recurrence(run) => {
+                    if !run.forward(&mut w.primal) {
+                        return false;
+                    }
+                }
+                Block::Moments(m) => {
+                    if !m.forward(inputs, &mut w.primal) {
+                        return false;
+                    }
+                }
                 Block::Scalar(range) => {
                     for &slot in &schedule.order[range.clone()] {
                         let i = usize::from(slot);
@@ -204,7 +335,7 @@ impl CompiledGraph {
                     }
                     // Finite addends cannot turn an infinite sum finite. On
                     // overflow the caller replays scalar steps for the precise error.
-                    let sum = values.iter().fold(w.primal[*initial], |a, &b| a + b);
+                    let sum = crate::ordered_sum::ordered_sum(w.primal[*initial], values);
                     if !sum.is_finite() {
                         return false;
                     }
@@ -218,10 +349,21 @@ impl CompiledGraph {
     pub(super) fn reverse_blocks(
         &self,
         schedule: &StaticSchedule,
+        inputs: &[f64],
         w: &mut Workspace,
     ) -> Result<(), AadError> {
         for block in schedule.blocks.iter().rev() {
             match block {
+                Block::Recurrence(run) => run
+                    .reverse(&w.primal, &mut w.adjoint)
+                    .map_err(|node| AadError::NonFiniteResult { node })?,
+                Block::Moments(m) => m.reverse(
+                    inputs,
+                    &mut w.adjoint,
+                    &mut w.input_adjoints,
+                    m.sum_output,
+                    m.square_output,
+                )?,
                 Block::Scalar(range) => self.reverse_slots(
                     &schedule.order[range.clone()],
                     &w.primal,

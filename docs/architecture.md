@@ -20,7 +20,7 @@ The bootstrap graph is a deliberately smaller independent prototype; it is **not
 - `CompiledGraph` is immutable and should be shareable between threads.
 - `Workspace` owns mutable scratch storage; one per worker.
 - `evaluate` reuses primal workspace; `vjp` accepts arbitrary output seeds and returns input adjoints.
-- Iterative evaluation now uses a per-workspace explicit task stack; inactive conditional branches are not evaluated, and the reverse sweep follows visited nodes.
+- Conditional evaluation follows compiled jumps and records the visited nodes for the reverse sweep.
 - Workspaces carry a compiled-graph identity, not just shape, and cannot be used with another graph.
 - Still pending: compact register allocation, generalized custom VJP, checkpoint/recompute policies, broader SIMD opcode coverage, optional isolated JIT backend.
 
@@ -34,7 +34,13 @@ Keep `#![forbid(unsafe_code)]` in the core. Do not promise bitwise identity acro
 
 ## Iterative evaluator constraints (experimental)
 
-The compiler traverses reachable nodes from the declared outputs in left-first dependency order. When this traversal encounters a select, the scalar interpreter evaluates each output on demand. It suspends a parent while computing an unvisited dependency and reads only the chosen arm of a select. A suspended frame holds one 16-bit node index. On graphs with a fixed traversal order, the compiler retains that order and workspaces replay it directly. Both traversals use explicit stacks to handle deep graphs.
+The compiler visits dependencies in left-first order. Conditional graphs use
+jumps to enter the chosen arm of a select. Shared interior expressions have
+one compiled body. The workspace memoizes each completed body for the path
+and reserves return addresses during preparation. The evaluator records a
+node after its value passes the finiteness check, preserving the first failing
+node and the completed prefix. The compiler and evaluator both handle deep
+graphs iteratively.
 
 Tests include a 50,000-step dependency chain, an invalid inactive branch with 20,000 nested nodes, graph identity checks, and repeated VJP calls.
 
@@ -77,3 +83,21 @@ at constant nodes and report the original error, if any.
 The two-lane arithmetic tape maps the ordered sum and dot-product blocks to
 its compact slots during preparation. It preserves multiplication and addition
 order independently in each lane, including for overlapping dot operands.
+
+
+A scalar sum starting at zero can use integer addition for 16 through 2,048
+terms when a runtime check proves every ordered prefix is exactly
+representable up to overflow. The terms must be normal numbers of the same
+sign and binary exponent, with at least ceil(log2(count)) trailing zero bits
+in every significand. Their integer total then fits in 64 bits and converts
+exactly back to binary64 at the common scale. Other inputs take the ordinary
+ordered floating-point path.
+
+Adjacent reductions for a sum and a sum of squares can share one input pass
+when their leaves have exactly those three operand uses. A repeated multiply
+and add with fixed scale and bias can keep the state in a register and retain
+the intermediate states needed for the scale derivative. Scalar and two-lane
+backends use the same kernels. When many adjoint slots belong to private
+intermediates, the compiler groups the surviving slots into ranges to clear
+on each VJP. The primitive schedule still locates the original failure on a
+nonfinite forward result.

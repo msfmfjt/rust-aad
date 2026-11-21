@@ -45,7 +45,7 @@ See [architecture](docs/architecture.md) and [benchmark plan](docs/benchmarks.md
 
 - Branches are lazy: inactive domain-invalid branches are not evaluated. For `select`, zero means false and any nonzero value means true; there is no adjoint to the selection condition.
 - `min`/`max` break ties to the left input. No special pathwise derivative is implied for digital discontinuities.
-- Evaluation uses an iterative task stack instead of Rust recursion. The regression suite includes a 50,000-step dependency chain.
+- Compilation and evaluation handle deep graphs iteratively. The regression suite includes a 50,000-step dependency chain.
 - Division reverse uses exponent scaling for extreme finite operands.
 - Input validation rejects nonfinite values. The gradient seed and intermediate errors are checked but extreme cancellation/overflow paths require more adversarial testing.
 - The core forbids unsafe Rust and has no C++/Python dependencies.
@@ -62,11 +62,11 @@ Graph-local `NodeId`s reject foreign handles; VJP checks nonfinite adjoints. Eva
 
 ## Development status (iterative graph evaluator)
 
-Graph evaluation now uses an explicit per-workspace stack rather than recursive Rust calls, preserving lazy selection of the active branch. Workspace identity is checked against the compiled graph, and regression tests cover deep graphs. The project is still experimental and has **not** demonstrated AADC-comparable performance.
+Conditional graphs execute jumps to the chosen branch and use a per-workspace return stack for shared expressions. Workspace identity is checked against the compiled graph, and regression tests cover deep graphs. The project is still experimental and has **not** demonstrated AADC-comparable performance.
 
 ## Reverse workspace and active-path sweep (experimental)
 
-Branch-free scalar graphs share a compiled sequence of reachable nodes across workers. Graphs with a reachable `select` use a per-workspace stack and record the nodes executed on each path. Both modes reverse their forward order, preserving floating-point accumulation for shared nodes and repeated outputs. `Workspace::executed_nodes()` reports the forward count, including the completed prefix after a numerical error. The allocator regression measures workspace construction and reuse.
+Branch-free scalar graphs share a compiled sequence of reachable nodes across workers. Graphs with a reachable `select` follow compiled jumps and record the nodes executed on each path. Both modes reverse their forward order, preserving floating-point accumulation for shared nodes and repeated outputs. `Workspace::executed_nodes()` reports the forward count, including the completed prefix after a numerical error. The allocator regression measures workspace construction and reuse.
 
 The numeric semantics (tie-breaking for `min/max`, pathwise derivative through the chosen select branch, and error handling) remain experimental.
 
